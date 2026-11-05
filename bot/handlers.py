@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import logging
+from collections.abc import Callable
 
 from aiogram import Bot, Router
 from aiogram.enums import ParseMode
@@ -20,7 +21,14 @@ from aiogram.types import (
 logger = logging.getLogger(__name__)
 
 PLAYER_BUTTON_TEXT = "🎧 Открыть плеер"
-MENU_BUTTON_TEXT = "🎧 Плеер"
+MENU_BUTTON_TEXT = "Плеер"
+
+WebAppUrlSource = str | Callable[[], str]
+
+
+def _current_webapp_url(source: WebAppUrlSource) -> str:
+    """Resolve either a constant URL or a callable rereading ``.env``."""
+    return (source() if callable(source) else source).strip().rstrip("/")
 
 
 def build_player_url(webapp_url: str) -> str | None:
@@ -68,8 +76,12 @@ def build_menu_button(webapp_url: str) -> MenuButtonWebApp | None:
     )
 
 
-async def configure_menu_button(bot: Bot, webapp_url: str) -> bool:
-    """Install ``MenuButtonWebApp`` for all private chats.
+async def configure_menu_button(
+    bot: Bot,
+    webapp_url: str,
+    chat_id: int | None = None,
+) -> bool:
+    """Install ``MenuButtonWebApp`` for the requested chat (or all chats).
 
     Returns ``True`` when Telegram acknowledged the update. Configuration
     failures are logged but never stop the API or the polling loop.
@@ -83,7 +95,13 @@ async def configure_menu_button(bot: Bot, webapp_url: str) -> bool:
         return False
 
     try:
-        await bot.set_chat_menu_button(menu_button=menu_button)
+        if chat_id is None:
+            await bot.set_chat_menu_button(menu_button=menu_button)
+        else:
+            await bot.set_chat_menu_button(
+                chat_id=chat_id,
+                menu_button=menu_button,
+            )
         return True
     except Exception:
         logger.warning(
@@ -120,17 +138,26 @@ async def send_welcome(message: Message, webapp_url: str) -> None:
     )
 
 
-def build_router(webapp_url: str) -> Router:
-    """Create the bot router with the configured Mini App URL."""
+def build_router(webapp_url: WebAppUrlSource) -> Router:
+    """Create the bot router that rereads the Mini App URL on every ``/start``."""
     router = Router(name="start")
 
     @router.message(CommandStart())
     async def start_handler(message: Message) -> None:
         # Re-apply the menu button on demand: this heals setups where the
         # startup API call failed (for example after a temporary network error).
+        url = _current_webapp_url(webapp_url)
         bot = getattr(message, "bot", None)
         if bot is not None:
-            await configure_menu_button(bot, webapp_url)
-        await send_welcome(message, webapp_url)
+            installed = await configure_menu_button(
+                bot, url, chat_id=message.chat.id
+            )
+            if installed:
+                print(
+                    "INFO: Отправлена кнопка с актуальным URL: "
+                    f"{build_player_url(url)}/",
+                    flush=True,
+                )
+        await send_welcome(message, url)
 
     return router

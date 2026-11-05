@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from backend.api import create_app
 from backend.db import close_db, init_db
 from bot.handlers import build_router, configure_menu_button
-from config import load_settings
+from config import get_webapp_url, load_settings
 
 settings = load_settings()
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ def _build_bot_runtime() -> tuple[Bot, Dispatcher] | None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dispatcher = Dispatcher()
-    dispatcher.include_router(build_router(settings.webapp_url))
+    dispatcher.include_router(build_router(get_webapp_url))
     return bot, dispatcher
 
 
@@ -49,7 +49,7 @@ async def _run_bot_polling(bot: Bot, dispatcher: Dispatcher) -> None:
                 "Не удалось обновить команды бота", exc_info=True
             )
 
-        await configure_menu_button(bot, settings.webapp_url)
+        await configure_menu_button(bot, get_webapp_url())
 
         # uvicorn owns process signals in embedded mode; the bot must not
         # install its own SIGINT/SIGTERM handlers or close the shared session.
@@ -110,7 +110,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.bot_task = bot_task
 
-        if not settings.webapp_url.startswith("https://"):
+        if not get_webapp_url().startswith("https://"):
             logger.warning(
                 "WEBAPP_URL пуст или не использует HTTPS — кнопка Mini App "
                 "не будет показана в боте. Для локальной разработки: "
@@ -132,11 +132,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = create_app(db_path=settings.db_path, lifespan=lifespan)
 
 
+class _QuietAccessLogFilter(logging.Filter):
+    """Hide uvicorn access logs for continuous local probes."""
+
+    QUIET_PATHS = {"/health", "/v1/models"}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple) and len(record.args) >= 3:
+            path = str(record.args[2]).split("?", 1)[0]
+            return path not in self.QUIET_PATHS
+        return True
+
+
 def _configure_logging() -> None:
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     )
+    # Local probes (health, OpenAI-style model discovery) must not flood the
+    # console. Keep the access log for real traffic only.
+    logging.getLogger("uvicorn.access").addFilter(_QuietAccessLogFilter())
 
 
 if __name__ == "__main__":

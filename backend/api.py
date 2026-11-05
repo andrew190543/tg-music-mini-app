@@ -139,6 +139,15 @@ def create_app(
         """Lightweight readiness endpoint used by uptime checks and probes."""
         return {"status": "ok"}
 
+    @app.get(
+        "/v1/models",
+        tags=["system"],
+        include_in_schema=False,
+    )
+    async def stub_models() -> dict[str, Any]:
+        """Quiet stub for local probes that expect an OpenAI-compatible API."""
+        return {"object": "list", "data": []}
+
     @app.get("/api/search", tags=["music"])
     async def search(
         q: Annotated[str, Query(min_length=1, max_length=200)],

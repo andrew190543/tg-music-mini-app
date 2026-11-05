@@ -70,7 +70,7 @@ def test_menu_button_uses_webapp_url():
 
     menu_button = build_menu_button("https://example.com")
     assert isinstance(menu_button, MenuButtonWebApp)
-    assert menu_button.text == "🎧 Плеер"
+    assert menu_button.text == "Плеер"
     assert menu_button.web_app.url == "https://example.com/app"
 
 

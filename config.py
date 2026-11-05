@@ -6,12 +6,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 DEFAULT_DB_PATH = "data/music.db"
+ENV_PATH = BASE_DIR / ".env"
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,18 @@ class Settings:
     def bot_enabled(self) -> bool:
         """The bot is started only when a real-looking token is configured."""
         return bool(self.bot_token) and ":" in self.bot_token
+
+
+def get_webapp_url() -> str:
+    """Return the current ``WEBAPP_URL`` reread from ``.env`` on each call.
+
+    The tunnel address can change during the bot lifetime, so it is important
+    that ``/start`` does not use the stale value cached by ``load_dotenv``.
+    """
+    values = dotenv_values(ENV_PATH)
+    if "WEBAPP_URL" in values:
+        return str(values["WEBAPP_URL"] or "").strip().rstrip("/")
+    return os.getenv("WEBAPP_URL", "").strip().rstrip("/")
 
 
 def load_settings() -> Settings:
