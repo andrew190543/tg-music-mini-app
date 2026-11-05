@@ -1,0 +1,421 @@
+import httpx
+import pytest
+
+from backend import audio_service
+
+
+class ChunkedStream(httpx.AsyncByteStream):
+    """One-shot async stream used by httpx.MockTransport responses."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class FakeYDL:
+    """Minimal yt-dlp stand-in that records parameters."""
+
+    def __init__(self, params, captured, info):
+        captured["params"] = params
+        self._captured = captured
+        self._info = info
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def extract_info(self, url, download=False):
+        self._captured["url"] = url
+        self._captured["download"] = download
+        return self._info
+
+
+async def test_search_tracks_refines_query_and_maps_results(monkeypatch):
+    captured = {}
+    info = {
+        "entries": [
+            {
+                "id": "abc",
+                "title": "Song A",
+                "uploader": "Uploader A",
+                "duration": 215.7,
+                "thumbnails": [
+                    {"url": "https://img/small.jpg"},
+                    {"url": "https://img/large.jpg"},
+                ],
+            },
+            {
+                "id": "def",
+                "title": "Song B",
+                "channel": "Channel B",
+                "duration": 240,
+                "thumbnail": "https://img/b.jpg",
+            },
+            {"title": "No id", "duration": 200},
+            None,
+        ]
+    }
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: FakeYDL(params, captured, info),
+    )
+
+    results = await audio_service.search_tracks("  Daft   Punk  ", limit=5)
+
+    assert captured["url"] == "ytsearch30:Daft Punk audio"
+    assert captured["download"] is False
+    assert captured["params"]["extract_flat"] is True
+    assert captured["params"]["quiet"] is True
+    assert results == [
+        {
+            "track_id": "abc",
+            "title": "Song A",
+            "artist": "Uploader A",
+            "duration": 215,
+            "thumbnail": "https://img/large.jpg",
+        },
+        {
+            "track_id": "def",
+            "title": "Song B",
+            "artist": "Channel B",
+            "duration": 240,
+            "thumbnail": "https://img/b.jpg",
+        },
+    ]
+
+
+async def test_search_tracks_filters_live_shorts_and_long_mixes(monkeypatch):
+    captured = {}
+    info = {
+        "entries": [
+            {"id": "valid45", "title": "45s", "duration": 45},
+            {"id": "valid900", "title": "15m", "duration": 900},
+            {"id": "valid215", "title": "Song", "duration": 215},
+            {"id": "short44", "title": "Short", "duration": 44},
+            {"id": "long901", "title": "Mix", "duration": 901},
+            {
+                "id": "live_status",
+                "title": "Live",
+                "duration": 300,
+                "live_status": "is_live",
+            },
+            {
+                "id": "is_live",
+                "title": "Live 2",
+                "duration": 300,
+                "is_live": True,
+            },
+            {"id": "unknown", "title": "Unknown", "duration": None},
+            {"id": "zero", "title": "Zero", "duration": 0},
+            {"id": "negative", "title": "Negative", "duration": -10},
+            {"id": "missing_duration", "title": "Missing"},
+            {"title": "No id", "duration": 300},
+        ]
+    }
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: FakeYDL(params, captured, info),
+    )
+
+    results = await audio_service.search_tracks("music", limit=10)
+
+    assert [track["track_id"] for track in results] == [
+        "valid45",
+        "valid900",
+        "valid215",
+    ]
+    assert captured["url"] == "ytsearch30:music audio"
+
+
+@pytest.mark.parametrize(
+    "query", ["Song official audio", "Song lyrics", "Song audio"]
+)
+async def test_search_tracks_does_not_duplicate_music_hint(
+    monkeypatch, query
+):
+    captured = {}
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: FakeYDL(params, captured, {"entries": []}),
+    )
+
+    assert await audio_service.search_tracks(query, limit=3) == []
+    assert captured["url"] == f"ytsearch30:{query}"
+
+
+async def test_search_tracks_returns_only_the_requested_limit(monkeypatch):
+    captured = {}
+    info = {
+        "entries": [
+            {"id": f"id{i}", "title": f"Song {i}", "duration": 200}
+            for i in range(10)
+        ]
+    }
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: FakeYDL(params, captured, info),
+    )
+
+    results = await audio_service.search_tracks("query", limit=3)
+
+    assert [track["track_id"] for track in results] == ["id0", "id1", "id2"]
+    assert captured["url"] == "ytsearch30:query audio"
+
+
+async def test_search_tracks_default_limit_is_15(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: FakeYDL(params, captured, {"entries": []}),
+    )
+
+    assert await audio_service.search_tracks("query") == []
+    assert captured["url"] == "ytsearch30:query audio"
+
+
+async def test_search_tracks_wraps_ytdlp_errors(monkeypatch):
+    class BrokenYDL:
+        def __init__(self, params):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def extract_info(self, url, download=False):
+            raise RuntimeError("network is down")
+
+    monkeypatch.setattr(audio_service.yt_dlp, "YoutubeDL", BrokenYDL)
+
+    with pytest.raises(audio_service.AudioServiceError):
+        await audio_service.search_tracks("query")
+
+
+async def test_search_tracks_empty_query_does_not_call_ytdlp(monkeypatch):
+    called = False
+
+    def fail_if_called(params):
+        nonlocal called
+        called = True
+        return FakeYDL(params, {}, {})
+
+    monkeypatch.setattr(audio_service.yt_dlp, "YoutubeDL", fail_if_called)
+
+    assert await audio_service.search_tracks("   ") == []
+    assert called is False
+
+
+async def test_get_audio_stream_url_uses_requested_format(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: FakeYDL(
+            params, captured, {"url": "https://cdn.example/audio.m4a"}
+        ),
+    )
+
+    url = await audio_service.get_audio_stream_url("abc123")
+
+    assert url == "https://cdn.example/audio.m4a"
+    assert captured["url"] == "https://www.youtube.com/watch?v=abc123"
+    assert captured["download"] is False
+    assert captured["params"]["format"] == "bestaudio[ext=m4a]/bestaudio"
+    assert captured["params"]["quiet"] is True
+    assert captured["params"]["noplaylist"] is True
+
+
+async def test_get_audio_stream_url_keeps_full_urls(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: FakeYDL(
+            params, captured, {"url": "https://cdn.example/audio.m4a"}
+        ),
+    )
+
+    page_url = "https://soundcloud.com/artist/track"
+    await audio_service.get_audio_stream_url(page_url)
+
+    assert captured["url"] == page_url
+
+
+async def test_get_audio_stream_url_falls_back_to_formats(monkeypatch):
+    captured = {}
+    info = {
+        "formats": [
+            {
+                "url": "https://cdn.example/audio.webm",
+                "acodec": "opus",
+                "ext": "webm",
+            },
+            {
+                "url": "https://cdn.example/audio.m4a",
+                "acodec": "mp4a",
+                "ext": "m4a",
+            },
+        ]
+    }
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: FakeYDL(params, captured, info),
+    )
+
+    url = await audio_service.get_audio_stream_url("abc123")
+
+    assert url == "https://cdn.example/audio.m4a"
+
+
+async def test_get_audio_stream_url_raises_without_direct_url(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: FakeYDL(params, captured, {"title": "No stream"}),
+    )
+
+    with pytest.raises(audio_service.AudioServiceError):
+        await audio_service.get_audio_stream_url("abc123")
+
+    with pytest.raises(ValueError, match="track_id"):
+        await audio_service.get_audio_stream_url("   ")
+
+
+async def test_proxy_audio_stream_forwards_range_and_yields_bytes():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["range"] = request.headers.get("range")
+        seen["accept_encoding"] = request.headers.get("accept-encoding")
+        return httpx.Response(
+            206,
+            headers={
+                "Content-Type": "audio/mp4",
+                "Content-Range": "bytes 0-9/100",
+                "Content-Length": "10",
+                "Accept-Ranges": "bytes",
+            },
+            stream=ChunkedStream([b"0123", b"456789"]),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        chunks = [
+            chunk
+            async for chunk in audio_service.proxy_audio_stream(
+                "https://cdn.example/audio", "bytes=0-9", client=client
+            )
+        ]
+    finally:
+        await client.aclose()
+
+    assert b"".join(chunks) == b"0123456789"
+    assert seen["range"] == "bytes=0-9"
+    assert seen["accept_encoding"] == "identity"
+    assert client.is_closed is True
+
+
+async def test_start_audio_stream_returns_metadata_and_body():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("range") == "bytes=0-9"
+        return httpx.Response(
+            206,
+            headers={
+                "Content-Type": "audio/mp4; codecs=mp4a.40.2",
+                "Content-Range": "bytes 0-9/100",
+                "Content-Length": "10",
+                "Accept-Ranges": "bytes",
+            },
+            stream=ChunkedStream([b"0123", b"456789"]),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        stream = await audio_service.start_audio_stream(
+            "https://cdn.example/audio",
+            "bytes=0-9",
+            client=client,
+            chunk_size=4,
+        )
+
+        assert stream.status_code == 206
+        assert stream.media_type == "audio/mp4"
+        assert stream.headers["Content-Range"] == "bytes 0-9/100"
+        assert stream.headers["Content-Length"] == "10"
+        assert stream.headers["Accept-Ranges"] == "bytes"
+
+        body = b"".join([chunk async for chunk in stream.body])
+        assert body == b"0123456789"
+        # A caller-owned client must not be closed by the service.
+        assert client.is_closed is False
+    finally:
+        await client.aclose()
+
+
+async def test_start_audio_stream_normalizes_mp4_media_type():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "video/mp4"},
+            stream=ChunkedStream([b"audio"]),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        stream = await audio_service.start_audio_stream(
+            "https://cdn.example/audio", client=client
+        )
+        assert stream.media_type == "audio/mp4"
+        assert b"".join([chunk async for chunk in stream.body]) == b"audio"
+    finally:
+        await client.aclose()
+
+
+async def test_start_audio_stream_raises_on_upstream_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, content=b"missing")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await audio_service.start_audio_stream(
+                "https://cdn.example/missing", client=client
+            )
+    finally:
+        await client.aclose()
+
+
+async def test_proxy_audio_stream_omits_range_when_not_requested():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["range"] = request.headers.get("range")
+        return httpx.Response(200, stream=ChunkedStream([b"audio"]))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        chunks = [
+            chunk
+            async for chunk in audio_service.proxy_audio_stream(
+                "https://cdn.example/audio", None, client=client
+            )
+        ]
+    finally:
+        await client.aclose()
+
+    assert b"".join(chunks) == b"audio"
+    assert seen["range"] is None

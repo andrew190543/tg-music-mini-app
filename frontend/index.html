@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#0d0f14">
+    <title>TG Music</title>
+    <link rel="stylesheet" href="./style.css">
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+    <script src="./app.js" defer></script>
+</head>
+<body>
+    <div class="app-shell">
+        <header class="topbar">
+            <div class="topbar__inner">
+                <div class="brand-row">
+                    <div class="brand">
+                        <span class="brand__icon" aria-hidden="true">
+                            <i data-lucide="audio-lines"></i>
+                        </span>
+                        <div class="brand__text">
+                            <span class="brand__eyebrow">Telegram Mini App</span>
+                            <h1 class="brand__title">TG Music</h1>
+                        </div>
+                    </div>
+                    <span id="api-badge" class="badge badge--pending" role="status" aria-live="polite">
+                        Проверка…
+                    </span>
+                </div>
+
+                <label class="search-field" for="search-input">
+                    <i class="search-field__icon" data-lucide="search" aria-hidden="true"></i>
+                    <input
+                        id="search-input"
+                        class="search-field__input"
+                        type="search"
+                        inputmode="search"
+                        autocomplete="off"
+                        spellcheck="false"
+                        placeholder="Трек, исполнитель или ссылка"
+                        aria-label="Поиск треков"
+                    >
+                    <button
+                        id="clear-search"
+                        class="search-field__clear"
+                        type="button"
+                        aria-label="Очистить поиск"
+                        hidden
+                    >
+                        <i data-lucide="x" aria-hidden="true"></i>
+                    </button>
+                </label>
+
+                <nav class="tabs" role="tablist" aria-label="Разделы">
+                    <button
+                        class="tab is-active"
+                        id="tab-search"
+                        type="button"
+                        role="tab"
+                        aria-selected="true"
+                        aria-controls="panel-search"
+                        data-tab="search"
+                    >
+                        <i data-lucide="search" aria-hidden="true"></i>
+                        <span>Поиск</span>
+                    </button>
+                    <button
+                        class="tab"
+                        id="tab-library"
+                        type="button"
+                        role="tab"
+                        aria-selected="false"
+                        aria-controls="panel-library"
+                        data-tab="library"
+                    >
+                        <i data-lucide="library" aria-hidden="true"></i>
+                        <span>Моя музыка</span>
+                    </button>
+                </nav>
+            </div>
+        </header>
+
+        <main class="content" id="content">
+            <div class="content__inner">
+                <section
+                    class="panel is-active"
+                    id="panel-search"
+                    role="tabpanel"
+                    aria-labelledby="tab-search"
+                    data-panel="search"
+                >
+                    <div class="section-heading">
+                        <div>
+                            <p class="section-heading__eyebrow">Каталог</p>
+                            <h2 class="section-heading__title" id="search-title">Популярное</h2>
+                        </div>
+                        <span class="section-heading__meta" id="search-count" aria-live="polite">
+                            Загрузка…
+                        </span>
+                    </div>
+
+                    <div class="track-list" id="track-list" aria-busy="true"></div>
+
+                    <div class="empty-state" id="search-empty" hidden>
+                        <span class="empty-state__icon" aria-hidden="true">
+                            <i data-lucide="search-x"></i>
+                        </span>
+                        <h3 id="search-empty-title">Ничего не найдено</h3>
+                        <p id="search-empty-text">
+                            Попробуйте изменить запрос или вставьте ссылку на трек.
+                        </p>
+                    </div>
+                </section>
+
+                <section
+                    class="panel"
+                    id="panel-library"
+                    role="tabpanel"
+                    aria-labelledby="tab-library"
+                    data-panel="library"
+                    hidden
+                >
+                    <div class="section-heading">
+                        <div>
+                            <p class="section-heading__eyebrow">Коллекция</p>
+                            <h2 class="section-heading__title">Моя музыка</h2>
+                        </div>
+                        <span class="section-heading__meta" id="library-count" aria-live="polite">0 треков</span>
+                    </div>
+
+                    <div class="track-list" id="library-list" aria-busy="true"></div>
+
+                    <div class="empty-state empty-state--large" id="library-empty">
+                        <span class="empty-state__icon" aria-hidden="true">
+                            <i data-lucide="heart"></i>
+                        </span>
+                        <h3>Пока пусто</h3>
+                        <p>
+                            Нажимайте на сердечко в результатах поиска —
+                            любимые треки появятся здесь.
+                        </p>
+                        <button
+                            class="button button--ghost"
+                            type="button"
+                            data-tab-target="search"
+                        >
+                            Найти музыку
+                        </button>
+                    </div>
+
+                    <div class="library-hint" id="library-hint">
+                        <i data-lucide="sparkles" aria-hidden="true"></i>
+                        <span>Плейлисты и история поиска появятся в следующих обновлениях.</span>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <div class="player-dock">
+            <div class="player-dock__inner">
+                <div class="mini-player" id="mini-player">
+                    <button
+                        class="mini-player__open"
+                        id="expand-player"
+                        type="button"
+                        aria-label="Открыть полноэкранный плеер"
+                    >
+                        <span class="cover cover--player mini-player__cover" aria-hidden="true">
+                            <i data-lucide="disc-3"></i>
+                        </span>
+                        <span class="mini-player__text">
+                            <span class="marquee">
+                                <span class="marquee__track">
+                                    <span class="marquee__text">Neon Skyline — Aurora Wave</span>
+                                    <span class="marquee__text" aria-hidden="true">Neon Skyline — Aurora Wave</span>
+                                </span>
+                            </span>
+                            <span class="mini-player__artist">Aurora Wave</span>
+                        </span>
+                    </button>
+
+                    <div class="mini-player__controls">
+                        <button
+                            class="icon-button"
+                            id="mini-play"
+                            type="button"
+                            aria-label="Воспроизвести"
+                        >
+                            <i data-lucide="play"></i>
+                        </button>
+                        <button
+                            class="icon-button"
+                            id="mini-next"
+                            type="button"
+                            aria-label="Следующий трек"
+                        >
+                            <i data-lucide="skip-forward"></i>
+                        </button>
+                    </div>
+
+                    <div class="mini-player__progress" aria-hidden="true">
+                        <span></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <section
+            class="full-player"
+            id="full-player"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Полноэкранный плеер"
+            aria-hidden="true"
+        >
+            <div class="full-player__inner">
+                <header class="full-player__header">
+                    <button
+                        class="icon-button icon-button--ghost"
+                        id="collapse-player"
+                        type="button"
+                        aria-label="Свернуть плеер"
+                    >
+                        <i data-lucide="chevron-down"></i>
+                    </button>
+
+                    <div class="full-player__header-text">
+                        <span class="full-player__eyebrow">Сейчас играет</span>
+                        <span class="full-player__source">TG Music</span>
+                    </div>
+
+                    <button
+                        class="icon-button icon-button--ghost"
+                        id="full-like"
+                        type="button"
+                        aria-label="Добавить в избранное"
+                        aria-pressed="false"
+                    >
+                        <i data-lucide="heart"></i>
+                    </button>
+                </header>
+
+                <div class="full-player__art">
+                    <div class="player-cover" id="player-cover" aria-hidden="true">
+                        <i data-lucide="disc-3"></i>
+                    </div>
+                </div>
+
+                <div class="full-player__meta">
+                    <h2 class="full-player__title" id="player-title">Neon Skyline</h2>
+                    <p class="full-player__artist" id="player-artist">Aurora Wave</p>
+                </div>
+
+                <div class="timeline">
+                    <input
+                        class="range range--seek"
+                        id="seek-bar"
+                        type="range"
+                        min="0"
+                        max="100"
+                        value="32"
+                        step="0.1"
+                        aria-label="Позиция воспроизведения"
+                        style="--value: 32%"
+                    >
+                    <div class="timeline__times">
+                        <span id="current-time">1:18</span>
+                        <span id="duration-time">4:03</span>
+                    </div>
+                </div>
+
+                <div class="transport">
+                    <button
+                        class="icon-button icon-button--soft"
+                        id="shuffle-btn"
+                        type="button"
+                        aria-label="Перемешать"
+                        aria-pressed="false"
+                    >
+                        <i data-lucide="shuffle"></i>
+                    </button>
+                    <button
+                        class="icon-button icon-button--soft"
+                        id="prev-btn"
+                        type="button"
+                        aria-label="Предыдущий трек"
+                    >
+                        <i data-lucide="skip-back"></i>
+                    </button>
+                    <button
+                        class="play-button"
+                        id="play-btn"
+                        type="button"
+                        aria-label="Воспроизвести"
+                    >
+                        <i data-lucide="play"></i>
+                    </button>
+                    <button
+                        class="icon-button icon-button--soft"
+                        id="next-btn"
+                        type="button"
+                        aria-label="Следующий трек"
+                    >
+                        <i data-lucide="skip-forward"></i>
+                    </button>
+                    <button
+                        class="icon-button icon-button--soft repeat-button"
+                        id="repeat-btn"
+                        type="button"
+                        aria-label="Повтор: выключен"
+                        aria-pressed="false"
+                        data-state="none"
+                    >
+                        <i data-lucide="repeat"></i>
+                        <span class="repeat-one" aria-hidden="true">1</span>
+                    </button>
+                </div>
+
+                <div class="volume">
+                    <button
+                        class="icon-button icon-button--ghost"
+                        id="mute-btn"
+                        type="button"
+                        aria-label="Выключить звук"
+                        aria-pressed="false"
+                    >
+                        <i data-lucide="volume-2"></i>
+                    </button>
+                    <input
+                        class="range range--volume"
+                        id="volume-bar"
+                        type="range"
+                        min="0"
+                        max="100"
+                        value="80"
+                        step="1"
+                        aria-label="Громкость"
+                        style="--value: 80%"
+                    >
+                    <span class="volume__value" id="volume-value">80%</span>
+                </div>
+            </div>
+        </section>
+    </div>
+</body>
+</html>
