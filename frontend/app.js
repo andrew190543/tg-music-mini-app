@@ -9,54 +9,7 @@
     const VOLUME_STORAGE_KEY = "tg-music-volume";
     const SEARCH_LIMIT = 15;
     const SEARCH_DEBOUNCE_MS = 450;
-    const POPULAR_QUERY = "top hits";
-
-    // Real YouTube IDs shown before the first /api/search response arrives.
-    // They are replaced with live yt-dlp results as soon as the search finishes.
-    const FALLBACK_TRACKS = [
-        {
-            track_id: "jfKfPfyJRdk",
-            title: "Lofi Hip Hop Radio — Beats to Relax / Study To",
-            artist: "Lofi Girl",
-            duration: 0,
-            thumbnail: "https://i.ytimg.com/vi/jfKfPfyJRdk/hqdefault.jpg",
-        },
-        {
-            track_id: "4xDzrJKXOOY",
-            title: "Blinding Lights",
-            artist: "The Weeknd",
-            duration: 200,
-            thumbnail: "https://i.ytimg.com/vi/4xDzrJKXOOY/hqdefault.jpg",
-        },
-        {
-            track_id: "dQw4w9WgXcQ",
-            title: "Never Gonna Give You Up",
-            artist: "Rick Astley",
-            duration: 213,
-            thumbnail: "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
-        },
-        {
-            track_id: "kJQP7kiw5Fk",
-            title: "Despacito",
-            artist: "Luis Fonsi, Daddy Yankee",
-            duration: 282,
-            thumbnail: "https://i.ytimg.com/vi/kJQP7kiw5Fk/hqdefault.jpg",
-        },
-        {
-            track_id: "JGwWNGJdvx8",
-            title: "Shape of You",
-            artist: "Ed Sheeran",
-            duration: 233,
-            thumbnail: "https://i.ytimg.com/vi/JGwWNGJdvx8/hqdefault.jpg",
-        },
-        {
-            track_id: "OPf0YbXqDm0",
-            title: "Uptown Funk",
-            artist: "Mark Ronson, Bruno Mars",
-            duration: 270,
-            thumbnail: "https://i.ytimg.com/vi/OPf0YbXqDm0/hqdefault.jpg",
-        },
-    ];
+    const TRENDING_LIMIT = 20;
 
     /* ---------- DOM ---------- */
 
@@ -80,6 +33,7 @@
     const fullPlayer = document.getElementById("full-player");
     const expandPlayer = document.getElementById("expand-player");
     const collapsePlayer = document.getElementById("collapse-player");
+    const playerDock = document.querySelector(".player-dock");
     const miniPlay = document.getElementById("mini-play");
     const miniNext = document.getElementById("mini-next");
     const miniCover = document.querySelector(".mini-player__cover");
@@ -386,6 +340,30 @@
         }
     }
 
+    function showCatalogSpinner(text = "Загрузка треков…") {
+        if (!trackList) {
+            return;
+        }
+
+        hideSearchEmpty();
+        trackList.hidden = false;
+
+        const spinner = document.createElement("div");
+        spinner.className = "catalog-spinner";
+
+        const ring = document.createElement("span");
+        ring.className = "catalog-spinner__ring";
+        ring.setAttribute("aria-hidden", "true");
+
+        const label = document.createElement("p");
+        label.className = "catalog-spinner__text";
+        label.textContent = text;
+
+        spinner.append(ring, label);
+        trackList.replaceChildren(spinner);
+        trackList.setAttribute("aria-busy", "true");
+    }
+
     function showSearchEmpty(title, text) {
         if (searchEmptyTitle) {
             searchEmptyTitle.textContent = title;
@@ -398,7 +376,7 @@
         }
     }
 
-    async function performSearch(rawQuery, { popular = false } = {}) {
+    async function performSearch(rawQuery) {
         const query = String(rawQuery ?? "").trim();
         if (!query) {
             return;
@@ -410,8 +388,8 @@
             searchTimer = null;
         }
 
-        setSearchHeading(popular ? "Популярное" : "Результаты поиска");
-        setSearchCount(popular && !popularLoaded ? "Загрузка…" : "Поиск…");
+        setSearchHeading("Результаты поиска");
+        setSearchCount("Поиск…");
         trackList?.setAttribute("aria-busy", "true");
         hideSearchEmpty();
 
@@ -437,22 +415,12 @@
                 .map(normalizeTrack)
                 .filter((track) => track.track_id);
 
-            if (popular) {
-                popularTracks = tracks;
-                popularLoaded = true;
-            }
-
             renderTracks(tracks);
             syncQueueFromCards({ preserveCurrent: Boolean(audio.src) });
             setSearchCount(pluralizeTracks(tracks.length));
 
             if (tracks.length) {
                 hideSearchEmpty();
-            } else if (popular) {
-                showSearchEmpty(
-                    "Популярное недоступно",
-                    "Введите название трека или исполнителя в поиске."
-                );
             } else {
                 showSearchEmpty(
                     "Ничего не найдено",
@@ -480,6 +448,74 @@
         }
     }
 
+    async function loadTrending() {
+        const requestId = ++searchRequestId;
+        if (searchTimer !== null) {
+            window.clearTimeout(searchTimer);
+            searchTimer = null;
+        }
+
+        setSearchHeading("Популярное");
+        setSearchCount("Загрузка…");
+        showCatalogSpinner();
+
+        try {
+            const response = await fetch(
+                `/api/trending?limit=${TRENDING_LIMIT}`,
+                {
+                    cache: "no-store",
+                    headers: { Accept: "application/json" },
+                }
+            );
+
+            if (!response.ok) {
+                throw new Error(`Trending HTTP ${response.status}`);
+            }
+
+            const payload = await response.json();
+            if (requestId !== searchRequestId) {
+                return;
+            }
+
+            const tracks = (Array.isArray(payload) ? payload : [])
+                .map(normalizeTrack)
+                .filter((track) => track.track_id);
+
+            popularTracks = tracks;
+            popularLoaded = true;
+            renderTracks(tracks);
+            syncQueueFromCards({ preserveCurrent: Boolean(audio.src) });
+            setSearchCount(pluralizeTracks(tracks.length));
+
+            if (tracks.length) {
+                hideSearchEmpty();
+            } else {
+                showSearchEmpty(
+                    "Популярное недоступно",
+                    "Введите название трека или исполнителя в поиске."
+                );
+            }
+        } catch (error) {
+            if (requestId !== searchRequestId) {
+                return;
+            }
+            console.error("Trending failed:", error);
+            setSearchCount("Ошибка загрузки");
+            popularLoaded = false;
+
+            if (!trackList?.children.length) {
+                showSearchEmpty(
+                    "Не удалось загрузить треки",
+                    "Проверьте подключение к интернету и попробуйте ещё раз."
+                );
+            }
+        } finally {
+            if (requestId === searchRequestId) {
+                trackList?.setAttribute("aria-busy", "false");
+            }
+        }
+    }
+
     function restorePopular() {
         if (searchTimer !== null) {
             window.clearTimeout(searchTimer);
@@ -488,7 +524,7 @@
         setSearchHeading("Популярное");
 
         if (!popularLoaded) {
-            performSearch(POPULAR_QUERY, { popular: true });
+            loadTrending();
             return;
         }
 
@@ -932,41 +968,32 @@
         }
 
         PlayerState.queue = tracks;
-
-        if (tracks.length) {
-            PlayerState.currentIndex = 0;
-            updateTrackUI(tracks[0]);
-        } else {
-            PlayerState.currentIndex = -1;
-            markCurrentCard();
-        }
+        PlayerState.currentIndex = -1;
+        markCurrentCard();
     }
 
     function setQueue(tracks, startIndex = -1) {
         PlayerState.queue = (Array.isArray(tracks) ? tracks : [])
             .map(normalizeTrack)
             .filter((track) => track.track_id);
-        PlayerState.currentIndex = -1;
 
         if (!PlayerState.queue.length) {
+            PlayerState.currentIndex = -1;
             markCurrentCard();
             return;
         }
 
-        const index =
-            startIndex >= 0 && startIndex < PlayerState.queue.length
-                ? startIndex
-                : 0;
-
         if (startIndex >= 0) {
+            const index = Math.min(
+                startIndex,
+                PlayerState.queue.length - 1
+            );
             playTrack(index);
-            return;
+        } else {
+            // No preselection: the player stays idle until the user picks one.
+            PlayerState.currentIndex = -1;
+            markCurrentCard();
         }
-
-        // Preselect the first track so pressing Play works immediately,
-        // but do not start a network request until the user asks for it.
-        PlayerState.currentIndex = index;
-        updateTrackUI(PlayerState.queue[index]);
     }
 
     /* ---------- Track UI ---------- */
@@ -986,6 +1013,22 @@
             element.style.removeProperty("background-image");
             element.classList.remove("has-image");
         }
+    }
+
+    function showPlayerDock() {
+        if (!playerDock) {
+            return;
+        }
+        playerDock.hidden = false;
+        playerDock.classList.add("is-visible");
+    }
+
+    function hidePlayerDock() {
+        if (!playerDock) {
+            return;
+        }
+        playerDock.classList.remove("is-visible");
+        playerDock.hidden = true;
     }
 
     function buildTrackCard(track, index) {
@@ -1174,6 +1217,7 @@
         }
 
         PlayerState.currentIndex = index;
+        showPlayerDock();
         updateTrackUI(track);
 
         audio.src = `/api/stream/${encodeURIComponent(track.track_id)}`;
@@ -1868,17 +1912,13 @@
     syncVolumeUI();
     loadFavorites();
 
-    // Paint real YouTube fallback tracks immediately, then replace them with
-    // live yt-dlp results as soon as /api/search answers.
-    popularTracks = FALLBACK_TRACKS.slice();
-    renderTracks(popularTracks);
-    syncQueueFromCards();
+    // The catalog stays empty (spinner only) until /api/trending answers.
     setSearchHeading("Популярное");
-    setSearchCount(pluralizeTracks(popularTracks.length));
+    setSearchCount("Загрузка…");
     hideSearchEmpty();
 
     updateTimeline();
-    performSearch(POPULAR_QUERY, { popular: true });
+    loadTrending();
 
     // Expose a small API so the search/favorites phases can replace the queue.
     window.TGMusicApp = {

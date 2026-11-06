@@ -19,6 +19,7 @@ from config import BASE_DIR, load_settings
 from .audio_service import (
     AudioServiceError,
     get_audio_stream_url,
+    get_trending_tracks,
     search_tracks,
     start_audio_stream,
 )
@@ -165,6 +166,12 @@ def create_app(
         except AudioServiceError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    @app.get("/api/trending", tags=["music"])
+    async def trending(
+        limit: Annotated[int, Query(ge=1, le=50)] = 20,
+    ) -> list[dict[str, Any]]:
+        """Return the real trending list cached in backend memory."""
+        return await get_trending_tracks(limit=limit)
     @app.get("/api/stream/{track_id}", tags=["music"])
     async def stream(track_id: str, request: Request) -> StreamingResponse:
         """Resolve the direct audio URL and proxy it with Range support."""

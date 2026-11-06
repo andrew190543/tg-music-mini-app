@@ -30,16 +30,22 @@ def test_health_frontend_cors_and_root_redirect(tmp_path):
         assert "TG Music" in index.text
         assert "./app.js" in index.text
         assert 'id="library-list"' in index.text
+        assert 'id="player-bar" hidden' in index.text
+        assert "Neon Skyline" not in index.text
+        assert "Aurora Wave" not in index.text
 
         script = client.get("/app/app.js")
         assert script.status_code == 200
         assert "api/health" in script.text
         assert "/api/search" in script.text
+        assert "/api/trending" in script.text
         assert "/api/favorites" in script.text
         assert "initDataUnsafe" in script.text
         assert "123456" in script.text
         assert "demo-" not in script.text
-        assert "jfKfPfyJRdk" in script.text
+        assert "FALLBACK_TRACKS" not in script.text
+        assert "jfKfPfyJRdk" not in script.text
+        assert "showCatalogSpinner" in script.text
 
         styles = client.get("/app/style.css")
         assert styles.status_code == 200
@@ -55,6 +61,63 @@ def test_health_frontend_cors_and_root_redirect(tmp_path):
         assert cors.headers["access-control-allow-origin"] == "*"
 
     assert database_path.is_file()
+
+
+def test_trending_endpoint_returns_cached_tracks(tmp_path, monkeypatch):
+    app = create_app(db_path=tmp_path / "api.db")
+    calls = {}
+
+    async def fake_trending(limit=20):
+        calls["limit"] = limit
+        return [
+            {
+                "track_id": "trend1",
+                "title": "Trending Song",
+                "artist": "Trend Artist",
+                "duration": 210,
+                "thumbnail": "https://img/trend.jpg",
+            }
+        ]
+
+    monkeypatch.setattr(api_module, "get_trending_tracks", fake_trending)
+
+    with TestClient(app) as client:
+        response = client.get("/api/trending")
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "track_id": "trend1",
+                "title": "Trending Song",
+                "artist": "Trend Artist",
+                "duration": 210,
+                "thumbnail": "https://img/trend.jpg",
+            }
+        ]
+        assert calls["limit"] == 20
+
+        limited = client.get("/api/trending", params={"limit": 5})
+        assert limited.status_code == 200
+        assert calls["limit"] == 5
+
+        assert client.get("/api/trending", params={"limit": 0}).status_code == 422
+        assert (
+            client.get("/api/trending", params={"limit": 51}).status_code
+            == 422
+        )
+
+
+def test_trending_endpoint_propagates_service_results(tmp_path, monkeypatch):
+    app = create_app(db_path=tmp_path / "api.db")
+
+    async def empty_trending(limit=20):
+        return []
+
+    monkeypatch.setattr(api_module, "get_trending_tracks", empty_trending)
+
+    with TestClient(app) as client:
+        response = client.get("/api/trending")
+        assert response.status_code == 200
+        assert response.json() == []
 
 
 def test_missing_frontend_is_reported(tmp_path):

@@ -419,3 +419,299 @@ async def test_proxy_audio_stream_omits_range_when_not_requested():
 
     assert b"".join(chunks) == b"audio"
     assert seen["range"] is None
+
+
+# ------------------------------------------------------------------ trending
+
+
+class MultiSearchYDL:
+    """yt-dlp stand-in answering each queried URL from a lookup table."""
+
+    def __init__(self, responses, queries):
+        self._responses = responses
+        self._queries = queries
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def extract_info(self, url, download=False):
+        if url not in self._responses:
+            raise AssertionError(f"Unexpected search url: {url}")
+        self._queries.append(url)
+        return self._responses[url]
+
+
+class FakeChartResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self._status_code = status_code
+
+    def raise_for_status(self):
+        if self._status_code >= 400:
+            raise RuntimeError(f"HTTP {self._status_code}")
+
+    def json(self):
+        return self._payload
+
+
+class FakeChartClient:
+    def __init__(self, responses):
+        self._responses = responses
+        self.requested_urls = []
+        self.closed = False
+
+    def get(self, url, headers=None):
+        self.requested_urls.append(url)
+        payload, status = self._responses.get(url, ({}, 404))
+        return FakeChartResponse(payload, status)
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture(autouse=True)
+def fresh_trending_cache():
+    audio_service.TRENDING_CACHE["tracks"] = []
+    audio_service.TRENDING_CACHE["updated_at"] = 0.0
+    yield
+    audio_service.TRENDING_CACHE["tracks"] = []
+    audio_service.TRENDING_CACHE["updated_at"] = 0.0
+
+
+def test_is_trending_track_rejects_compilations_and_conference_lengths():
+    def entry(**kwargs):
+        base = {"id": "x", "title": "Song", "duration": 200}
+        base.update(kwargs)
+        return base
+
+    assert audio_service._is_trending_track(entry()) is True
+    assert audio_service._is_trending_track(entry(duration=60)) is True
+    assert audio_service._is_trending_track(entry(duration=420)) is True
+
+    assert audio_service._is_trending_track(entry(duration=59)) is False
+    assert audio_service._is_trending_track(entry(duration=421)) is False
+    assert (
+        audio_service._is_trending_track(entry(title="Summer Mix 2026"))
+        is False
+    )
+    assert (
+        audio_service._is_trending_track(
+            entry(title="Best Compilation of Hits")
+        )
+        is False
+    )
+    assert (
+        audio_service._is_trending_track(entry(title="Hits 1 Hour"))
+        is False
+    )
+    assert (
+        audio_service._is_trending_track(entry(title="Non-Stop Party"))
+        is False
+    )
+    assert (
+        audio_service._is_trending_track(entry(title="Song Live Version"))
+        is False
+    )
+    assert (
+        audio_service._is_trending_track(entry(duration=None)) is False
+    )
+    assert (
+        audio_service._is_trending_track(
+            entry(duration=3600, title="Long Stream")
+        )
+        is False
+    )
+
+
+async def test_trending_stage1_maps_apple_chart_to_youtube_ids(monkeypatch):
+    chart_payload = {
+        "feed": {
+            "results": [
+                {"name": "Song One", "artistName": "Artist One"},
+                {"name": "Song Two", "artistName": "Artist Two"},
+                {"name": "", "artistName": "Broken"},
+                {"name": "Song Three", "artistName": ""},
+            ]
+        }
+    }
+    responses = {
+        audio_service.TRENDING_URLS[0]: (chart_payload, 200),
+        audio_service.TRENDING_URLS[1]: ({}, 200),
+    }
+    client = FakeChartClient(responses)
+    monkeypatch.setattr(
+        audio_service.httpx, "Client", lambda **kwargs: client
+    )
+
+    queries = []
+    yt_responses = {
+        "ytsearch1:Artist One Song One official audio": {
+            "entries": [
+                {
+                    "id": "yt_one",
+                    "title": "Song One official audio",
+                    "uploader": "Artist One VEVO",
+                    "duration": 199,
+                    "thumbnail": "https://img/one.jpg",
+                }
+            ]
+        },
+        "ytsearch1:Artist Two Song Two official audio": {
+            "entries": [
+                {
+                    "id": "yt_two",
+                    "title": "Song Two (visualizer)",
+                    "channel": "Artist Two",
+                    "duration": 300,
+                }
+            ]
+        },
+    }
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: MultiSearchYDL(yt_responses, queries),
+    )
+
+    tracks = await audio_service.get_trending_tracks(limit=20)
+
+    assert [track["track_id"] for track in tracks][:2] == ["yt_one", "yt_two"]
+    first = tracks[0]
+    assert first["title"] == "Song One"
+    assert first["artist"] == "Artist One"
+    assert first["duration"] == 199
+    assert first["thumbnail"] == "https://img/one.jpg"
+
+    # Only the needed artist/title searches were performed.
+    assert len(queries) <= 20
+    assert client.closed is True
+
+
+async def test_trending_falls_back_to_pooled_search(monkeypatch):
+    client = FakeChartClient({})
+    monkeypatch.setattr(
+        audio_service.httpx, "Client", lambda **kwargs: client
+    )
+
+    queries = []
+    pool_1 = {
+        "entries": [
+            {"id": "ok1", "title": "Hit Song", "duration": 210},
+            {"id": "mix", "title": "Best Mix 2026", "duration": 210},
+            {"id": "hour", "title": "1 Hour of Hits", "duration": 3600},
+            {"id": "ok2", "title": "Another Hit", "duration": 300},
+        ]
+    }
+    pool_2 = {
+        "entries": [
+            {"id": "ok1", "title": "Hit Song", "duration": 210},
+            {"id": "ok3", "title": "Trending Song", "duration": 240},
+        ]
+    }
+    fallback_queries = audio_service.TRENDING_FALLBACK_QUERIES
+    yt_responses = {
+        f"ytsearch35:{fallback_queries[0]}": pool_1,
+        f"ytsearch35:{fallback_queries[1]}": pool_2,
+    }
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: MultiSearchYDL(yt_responses, queries),
+    )
+
+    tracks = await audio_service.get_trending_tracks(limit=10)
+
+    assert [track["track_id"] for track in tracks] == ["ok1", "ok2", "ok3"]
+
+    expected_queries = [
+        f"ytsearch35:{query}" for query in fallback_queries
+    ]
+    assert queries == expected_queries
+
+
+async def test_trending_cache_is_used_within_ttl(monkeypatch):
+    monkeypatch.setattr(audio_service, "_get_trending_tracks_sync",
+                        lambda limit: [{"track_id": "t1", "title": "T",
+                                        "artist": "A", "duration": 200,
+                                        "thumbnail": None}])
+
+    first = await audio_service.get_trending_tracks()
+    second = await audio_service.get_trending_tracks(limit=20)
+
+    assert first == second
+    assert first[0]["track_id"] == "t1"
+
+
+async def test_trending_cache_refreshes_after_ttl(monkeypatch):
+    calls = []
+    clock = {"value": 1000.0}
+
+    def fake_sync(limit):
+        calls.append(limit)
+        return [{"track_id": "t1", "title": "T", "artist": "A",
+                 "duration": 200, "thumbnail": None}]
+
+    def fake_monotonic():
+        return clock["value"]
+
+    monkeypatch.setattr(audio_service.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(audio_service, "_get_trending_tracks_sync", fake_sync)
+
+    await audio_service.get_trending_tracks()
+    await audio_service.get_trending_tracks()
+    assert len(calls) == 1
+
+    # Advance past the TTL: the cache must be refreshed once.
+    clock["value"] += audio_service.TRENDING_CACHE_TTL_SECONDS + 1
+    await audio_service.get_trending_tracks()
+    assert len(calls) == 2
+
+
+async def test_trending_keeps_previous_cache_when_refresh_fails(monkeypatch):
+    calls = []
+
+    def fake_sync(limit):
+        calls.append(limit)
+        if len(calls) == 1:
+            return [{"track_id": "cached", "title": "T", "artist": "A",
+                     "duration": 200, "thumbnail": None}]
+        raise RuntimeError("yt-dlp exploded")
+
+    monkeypatch.setattr(audio_service, "_get_trending_tracks_sync", fake_sync)
+
+    first = await audio_service.get_trending_tracks()
+    audio_service.TRENDING_CACHE["updated_at"] = (
+        audio_service.time.monotonic()
+        - audio_service.TRENDING_CACHE_TTL_SECONDS
+        - 1
+    )
+    second = await audio_service.get_trending_tracks()
+
+    # A failed refresh keeps serving the previous (stale) list instead of
+    # returning an empty trending screen.
+    assert first[0]["track_id"] == "cached"
+    assert second == first
+    assert len(calls) == 2
+    assert audio_service.TRENDING_CACHE["tracks"][0]["track_id"] == "cached"
+
+
+async def test_trending_limits_are_sane(monkeypatch):
+    captured = {}
+
+    def fake_sync(limit):
+        captured["limit"] = limit
+        return []
+
+    monkeypatch.setattr(audio_service, "_get_trending_tracks_sync", fake_sync)
+
+    await audio_service.get_trending_tracks(limit=3)
+    assert captured["limit"] == 3
+
+    await audio_service.get_trending_tracks(limit=1000)
+    assert captured["limit"] == audio_service.MAX_SEARCH_RESULTS
+
+    await audio_service.get_trending_tracks(limit="bad")
+    assert captured["limit"] == 20

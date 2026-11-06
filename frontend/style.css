@@ -323,6 +323,46 @@ svg {
     margin: 0 auto;
 }
 
+/* ---------- Catalog loading spinner ---------- */
+
+.catalog-spinner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 56px 0 44px;
+    color: var(--tg-hint);
+}
+
+.catalog-spinner__ring {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 3px solid var(--border-strong);
+    border-top-color: var(--tg-button);
+    animation: catalog-spin 0.8s linear infinite;
+}
+
+.catalog-spinner__text {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+}
+
+@keyframes catalog-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .catalog-spinner__ring {
+        animation-duration: 1.6s;
+    }
+}
+
 .panel[hidden] {
     display: none;
 }
@@ -631,6 +671,21 @@ svg {
     backdrop-filter: blur(18px);
     -webkit-backdrop-filter: blur(18px);
     border-top: 1px solid var(--border);
+    opacity: 0;
+    transform: translateY(100%);
+    transition:
+        transform 0.28s ease,
+        opacity 0.28s ease;
+}
+
+/* Hidden until the user picks a track. */
+.player-dock[hidden] {
+    display: none;
+}
+
+.player-dock.is-visible {
+    opacity: 1;
+    transform: none;
 }
 
 .player-dock__inner {
