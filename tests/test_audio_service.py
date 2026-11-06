@@ -7,6 +7,17 @@ import pytest
 from backend import audio_service
 
 
+@pytest.fixture(autouse=True)
+def disposable_shared_stream_client():
+    """Drop the module-level stream client after each test.
+
+    Every test runs on its own event loop; a shared client opened in one
+    loop must never survive into the next one.
+    """
+    yield
+    audio_service._stream_client = None
+
+
 class ChunkedStream(httpx.AsyncByteStream):
     """One-shot async stream used by httpx.MockTransport responses."""
 
@@ -422,6 +433,54 @@ async def test_proxy_audio_stream_omits_range_when_not_requested():
 
     assert b"".join(chunks) == b"audio"
     assert seen["range"] is None
+
+
+async def test_shared_stream_client_is_reused_across_calls():
+    await audio_service.close_stream_client()
+    first = await audio_service._get_stream_client()
+    second = await audio_service._get_stream_client()
+
+    # Same process-wide client instance, still open for further streams.
+    assert first is second
+    assert first.is_closed is False
+
+    await audio_service.close_stream_client()
+    # Closing twice is safe and the next call creates a fresh client.
+    assert audio_service._stream_client is None
+    await audio_service.close_stream_client()
+
+
+async def test_start_audio_stream_defaults_to_shared_client(monkeypatch):
+    """Without an explicit client, streams use (and do not close) the shared one."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "audio/mpeg"},
+            stream=ChunkedStream([b"audio"]),
+        )
+
+    shared = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def fake_get_client():
+        return shared
+
+    monkeypatch.setattr(audio_service, "_get_stream_client", fake_get_client)
+
+    try:
+        first = await audio_service.start_audio_stream(
+            "https://cdn.example/audio",
+        )
+        second = await audio_service.start_audio_stream(
+            "https://cdn.example/audio",
+        )
+
+        body = b"".join([chunk async for chunk in second.body])
+        assert body == b"audio"
+        # The body iterator must not close the shared client.
+        assert shared.is_closed is False
+        del first, second
+    finally:
+        await shared.aclose()
 
 
 # ------------------------------------------------------------------ trending

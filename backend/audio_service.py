@@ -116,6 +116,38 @@ BROWSER_USER_AGENT = (
 )
 STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
 
+# The streaming proxy reuses one client across requests: creating a fresh
+# client per stream would redo the TCP+TLS handshake against the CDN on
+# every play/seek request.
+_stream_client: httpx.AsyncClient | None = None
+_stream_client_lock = asyncio.Lock()
+
+
+async def _get_stream_client() -> httpx.AsyncClient:
+    """Return the shared asynchronous httpx client for upstream streams.
+
+    The client is created lazily (once per process) and lives until
+    :func:`close_stream_client` is called from the app lifespan.
+    """
+    global _stream_client
+    async with _stream_client_lock:
+        if _stream_client is None or _stream_client.is_closed:
+            _stream_client = httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=STREAM_TIMEOUT,
+            )
+        return _stream_client
+
+
+async def close_stream_client() -> None:
+    """Close the shared stream client, if one is open. Safe to call twice."""
+    global _stream_client
+    async with _stream_client_lock:
+        if _stream_client is not None and not _stream_client.is_closed:
+            await _stream_client.aclose()
+        _stream_client = None
+
+
 _FORWARDED_HEADERS = {
     "content-type": "Content-Type",
     "content-length": "Content-Length",
@@ -939,9 +971,16 @@ async def start_audio_stream(
 ) -> AudioStream:
     """Open an upstream audio stream and return its status, headers and body.
 
-    The returned body iterator closes the upstream response (and the client,
-    when it was created here) in a ``finally`` block, so it is safe to hand it
-    to :class:`fastapi.responses.StreamingResponse`.
+    When no explicit ``client`` is passed, the process-wide client from
+    :func:`_get_stream_client` is used, so consecutive streams reuse pooled
+    connections instead of repeating the TCP+TLS handshake.
+
+    The returned body iterator closes the upstream response in a ``finally``
+    block, so it is safe to hand it to
+    :class:`fastapi.responses.StreamingResponse`. The client itself is never
+    closed here: the shared one is owned by the app lifespan (call
+    :func:`close_stream_client` on shutdown), and an explicitly passed client
+    is owned by its caller.
     """
     target = str(url or "").strip()
     if not target:
@@ -949,12 +988,8 @@ async def start_audio_stream(
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
 
-    owns_client = client is None
     if client is None:
-        client = httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=STREAM_TIMEOUT,
-        )
+        client = await _get_stream_client()
 
     response: httpx.Response | None = None
     try:
@@ -966,8 +1001,6 @@ async def start_audio_stream(
     except Exception:
         if response is not None:
             await response.aclose()
-        if owns_client:
-            await client.aclose()
         raise
 
     async def body() -> AsyncIterator[bytes]:
@@ -977,8 +1010,6 @@ async def start_audio_stream(
                     yield chunk
         finally:
             await response.aclose()
-            if owns_client:
-                await client.aclose()
 
     return AudioStream(
         status_code=response.status_code,

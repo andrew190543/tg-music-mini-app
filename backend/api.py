@@ -16,17 +16,19 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from config import BASE_DIR, load_settings
+from config import BASE_DIR, get_auth_mode, get_bot_token, load_settings
 
 from .audio_service import (
     AudioServiceError,
     AudioStream,
+    close_stream_client,
     get_audio_stream_url,
     get_trending_tracks,
     search_tracks,
     start_audio_stream,
 )
 from .db import Database
+from .telegram_auth import validate_init_data
 
 APP_VERSION = "0.1.0"
 logger = logging.getLogger(__name__)
@@ -37,13 +39,56 @@ LifespanFactory = Callable[[FastAPI], AbstractAsyncContextManager[None]]
 class FavoriteCreate(BaseModel):
     """Payload for adding a track to favorites."""
 
-    user_id: int = Field(gt=0)
+    # In fallback mode (local development/tests) the sender's id comes from
+    # the body; with a configured bot token the id is taken from signed
+    # initData instead and this field is ignored.
+    user_id: int | None = Field(default=None, gt=0)
     track_id: str = Field(min_length=1, max_length=200)
     title: str = Field(min_length=1, max_length=300)
     artist: str = Field(default="", max_length=300)
     duration: int = Field(default=0, ge=0)
     thumbnail: str = Field(default="", max_length=2000)
     url: str = Field(default="", max_length=2000)
+
+
+def _init_data_from_request(request: Request) -> str:
+    """Extract raw initData from the ``Authorization: tma <initData>`` header."""
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("tma "):
+        return header[4:].strip()
+    return ""
+
+
+def _resolve_user_id(request: Request, fallback_user_id: int | None) -> int:
+    """Resolve the Telegram user id shared by the favorites endpoints.
+
+    * With a configured bot token (``AUTH_MODE=auto``) the id MUST come from
+      valid signed initData; anything else is ``401`` \u2014 the explicit
+      ``user_id`` from the request is never trusted.
+    * Without a token (local development/tests) \u2014 or with ``AUTH_MODE=off``
+      \u2014 the explicit ``fallback_user_id`` is used; a missing one is ``422``.
+    """
+    if get_bot_token() and get_auth_mode() != "off":
+        init_data = _init_data_from_request(request)
+        if not init_data:
+            raise HTTPException(
+                status_code=401,
+                detail="Missing Telegram initData (Authorization: tma ...)",
+            )
+        result = validate_init_data(init_data, get_bot_token())
+        if not result.ok:
+            logger.warning("Rejected Telegram initData: %s", result.reason)
+            raise HTTPException(
+                status_code=401,
+                detail=f"Invalid Telegram initData: {result.reason}",
+            )
+        return result.user_id
+
+    if fallback_user_id is None:
+        raise HTTPException(
+            status_code=422, detail="user_id is required"
+        )
+    return fallback_user_id
 
 
 def _favorite_track(payload: FavoriteCreate) -> dict[str, Any]:
@@ -103,6 +148,7 @@ def create_app(
             yield
         finally:
             warm_task.cancel()
+            await close_stream_client()
             await database.close()
 
     app = FastAPI(
@@ -264,11 +310,16 @@ def create_app(
     @app.get("/api/favorites", tags=["favorites"])
     async def list_favorites(
         request: Request,
-        user_id: Annotated[int, Query(gt=0)],
+        user_id: Annotated[int | None, Query(gt=0)] = None,
     ) -> list[dict[str, Any]]:
-        """Return the user's saved tracks."""
+        """Return the user's saved tracks.
+
+        The owner of the list is the signed initData user when the bot token
+        is configured; otherwise the explicit ``user_id`` query parameter.
+        """
         database: Database = request.app.state.db
-        return await database.list_favorites(user_id)
+        resolved_user_id = _resolve_user_id(request, user_id)
+        return await database.list_favorites(resolved_user_id)
 
     @app.post("/api/favorites", tags=["favorites"])
     async def add_favorite(
@@ -277,10 +328,11 @@ def create_app(
     ) -> dict[str, Any]:
         """Add a track to favorites (idempotent)."""
         database: Database = request.app.state.db
+        resolved_user_id = _resolve_user_id(request, payload.user_id)
         track = _favorite_track(payload)
 
         try:
-            added = await database.add_favorite(payload.user_id, track)
+            added = await database.add_favorite(resolved_user_id, track)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -290,7 +342,7 @@ def create_app(
     async def remove_favorite(
         track_id: str,
         request: Request,
-        user_id: Annotated[int, Query(gt=0)],
+        user_id: Annotated[int | None, Query(gt=0)] = None,
     ) -> dict[str, bool]:
         """Remove a track from the user's favorites."""
         cleaned_track_id = track_id.strip()
@@ -298,7 +350,8 @@ def create_app(
             raise HTTPException(status_code=422, detail="track_id is required")
 
         database: Database = request.app.state.db
-        removed = await database.remove_favorite(user_id, cleaned_track_id)
+        resolved_user_id = _resolve_user_id(request, user_id)
+        removed = await database.remove_favorite(resolved_user_id, cleaned_track_id)
         return {"removed": removed}
 
     @app.get("/", include_in_schema=False)

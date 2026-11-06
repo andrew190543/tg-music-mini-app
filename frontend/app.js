@@ -11,6 +11,28 @@
     const SEARCH_DEBOUNCE_MS = 450;
     const TRENDING_LIMIT = 20;
 
+    /**
+     * Build request headers for authenticated API calls.
+     *
+     * When the Mini App runs inside Telegram, the raw initData is included so
+     * the backend can verify the sender's identity (HMAC-signed). Outside
+     * Telegram (local dev) there is no initData and the backend falls back to
+     * the explicit user_id in the query/body.
+     */
+    function apiHeaders(extra = {}) {
+        const headers = { Accept: "application/json", ...extra };
+        try {
+            const initData = window.Telegram?.WebApp?.initData;
+            if (initData) {
+                headers.Authorization = `tma ${initData}`;
+            }
+        } catch {
+            // WebApp API may be unavailable outside Telegram.
+        }
+        return headers;
+    }
+
+
     /* ---------- DOM ---------- */
 
     const badge = document.getElementById("api-badge");
@@ -821,7 +843,7 @@
                 )}`,
                 {
                     cache: "no-store",
-                    headers: { Accept: "application/json" },
+                    headers: apiHeaders(),
                 }
             );
 
@@ -919,11 +941,10 @@
                     method: wasFavorite ? "DELETE" : "POST",
                     cache: "no-store",
                     headers: wasFavorite
-                        ? { Accept: "application/json" }
-                        : {
-                              Accept: "application/json",
+                        ? apiHeaders()
+                        : apiHeaders({
                               "Content-Type": "application/json",
-                          },
+                          }),
                     body: wasFavorite
                         ? undefined
                         : JSON.stringify(favoritePayload(normalized)),

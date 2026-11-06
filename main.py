@@ -16,7 +16,7 @@ from aiogram.types import BotCommand
 from fastapi import FastAPI
 
 from backend.api import create_app
-from backend.audio_service import get_trending_tracks
+from backend.audio_service import close_stream_client, get_trending_tracks
 from backend.db import close_db, init_db
 from bot.handlers import build_router, configure_menu_button
 from config import get_webapp_url, load_settings
@@ -164,6 +164,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await asyncio.gather(bot_task, return_exceptions=True)
         if bot is not None:
             await bot.session.close()
+        await close_stream_client()
         await close_db()
 
 

@@ -44,6 +44,36 @@ def get_webapp_url() -> str:
     return os.getenv("WEBAPP_URL", "").strip().rstrip("/")
 
 
+def get_bot_token() -> str:
+    """Return the current ``BOT_TOKEN`` reread from ``.env`` on each call.
+
+    Like :func:`get_webapp_url`, the token must never be cached: it can be
+    rotated while the process is running and the API rechecks it on every
+    authenticated request.
+    """
+    values = dotenv_values(ENV_PATH)
+    if "BOT_TOKEN" in values:
+        return str(values["BOT_TOKEN"] or "").strip()
+    return os.getenv("BOT_TOKEN", "").strip()
+
+
+def get_auth_mode() -> str:
+    """Return ``AUTH_MODE`` as ``auto`` (default) or ``off``.
+
+    * ``auto`` - when a bot token is configured, favorites endpoints require
+      valid signed initData; without a token they fall back to the explicit
+      ``user_id`` (local development and tests).
+    * ``off``  - always use the fallback ``user_id``, even with a token.
+    """
+    values = dotenv_values(ENV_PATH)
+    raw = ""
+    if "AUTH_MODE" in values:
+        raw = str(values["AUTH_MODE"] or "").strip().lower()
+    if not raw:
+        raw = os.getenv("AUTH_MODE", "").strip().lower()
+    return raw if raw in {"auto", "off"} else "auto"
+
+
 def load_settings() -> Settings:
     """Read settings from the environment, applying safe defaults."""
     bot_token = os.getenv("BOT_TOKEN", "").strip()

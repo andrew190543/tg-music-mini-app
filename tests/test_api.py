@@ -1,3 +1,9 @@
+import hashlib
+import hmac
+import json
+import time
+from urllib.parse import quote
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -5,6 +11,27 @@ from fastapi.testclient import TestClient
 import backend.api as api_module
 from backend.api import create_app
 from backend.audio_service import AudioServiceError, AudioStream
+
+AUTH_BOT_TOKEN = "7000000000:AAExampleTokenForTests"
+
+
+def _signed_init_data(user_id: int, bot_token: str = AUTH_BOT_TOKEN) -> str:
+    """Build a valid signed initData string for the given user."""
+    pairs = [
+        ("auth_date", str(int(time.time()))),
+        ("user", json.dumps({"id": user_id}, separators=(", ", ": "))),
+    ]
+    check_string = "\n".join(sorted(f"{k}={v}" for k, v in pairs))
+    secret = hmac.new(
+        b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256
+    ).digest()
+    computed = hmac.new(
+        secret, check_string.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    encoded = "&".join(
+        f"{key}={quote(value, safe='')}" for key, value in pairs
+    )
+    return f"{encoded}&hash={computed}"
 
 
 def test_health_frontend_cors_and_root_redirect(tmp_path):
@@ -361,3 +388,72 @@ def test_favorites_validation_and_custom_url(tmp_path):
             ).status_code
             == 422
         )
+
+
+def test_favorites_require_signed_init_data_when_token_configured(tmp_path, monkeypatch):
+    """With BOT_TOKEN set, the explicit user_id must never be trusted."""
+    app = create_app(db_path=tmp_path / "api.db")
+    monkeypatch.setattr(api_module, "get_bot_token", lambda: AUTH_BOT_TOKEN)
+
+    with TestClient(app) as client:
+        # A request without initData is rejected even with a valid user_id.
+        assert (
+            client.get("/api/favorites", params={"user_id": 42}).status_code
+            == 401
+        )
+        # A tampered payload is rejected too.
+        tampered = _signed_init_data(42).replace(
+            quote('{"id": 42}', safe=""), quote('{"id": 99}', safe="")
+        )
+        assert tampered != _signed_init_data(42)
+        assert (
+            client.get(
+                "/api/favorites",
+                headers={"Authorization": f"tma {tampered}"},
+            ).status_code
+            == 401
+        )
+
+        # A valid signature authorizes the request; the user comes from the
+        # signed payload (no explicit user_id needed anywhere).
+        auth = {"Authorization": f"tma {_signed_init_data(42)}"}
+        added = client.post(
+            "/api/favorites",
+            headers=auth,
+            json={"track_id": "abc123", "title": "Song", "duration": 180},
+        )
+        assert added.status_code == 200
+
+        favorites = client.get("/api/favorites", headers=auth)
+        assert favorites.status_code == 200
+        assert [track["track_id"] for track in favorites.json()] == ["abc123"]
+
+        # Another signed user must not see user 42's tracks.
+        other = client.get(
+            "/api/favorites",
+            headers={"Authorization": f"tma {_signed_init_data(99)}"},
+        )
+        assert other.status_code == 200
+        assert other.json() == []
+
+        removed = client.delete("/api/favorites/abc123", headers=auth)
+        assert removed.status_code == 200
+        assert removed.json() == {"removed": True}
+
+
+def test_favorites_auth_mode_off_accepts_explicit_user_id(tmp_path, monkeypatch):
+    """AUTH_MODE=off keeps the fallback even with a configured token."""
+    app = create_app(db_path=tmp_path / "api.db")
+    monkeypatch.setattr(api_module, "get_bot_token", lambda: AUTH_BOT_TOKEN)
+    monkeypatch.setattr(api_module, "get_auth_mode", lambda: "off")
+
+    with TestClient(app) as client:
+        added = client.post(
+            "/api/favorites",
+            json={"user_id": 42, "track_id": "abc123", "title": "Song"},
+        )
+        assert added.status_code == 200
+
+        favorites = client.get("/api/favorites", params={"user_id": 42})
+        assert favorites.status_code == 200
+        assert [track["track_id"] for track in favorites.json()] == ["abc123"]
