@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 import httpx
 import pytest
 
@@ -458,6 +461,8 @@ class FakeChartResponse:
 
 
 class FakeChartClient:
+    """Sync httpx-like stand-in for the Yandex/Deezer chart HTTP calls."""
+
     def __init__(self, responses):
         self._responses = responses
         self.requested_urls = []
@@ -471,14 +476,25 @@ class FakeChartClient:
     def close(self):
         self.closed = True
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
+
 
 @pytest.fixture(autouse=True)
 def fresh_trending_cache():
     audio_service.TRENDING_CACHE["tracks"] = []
     audio_service.TRENDING_CACHE["updated_at"] = 0.0
+    audio_service.TRENDING_CACHE["empty_at"] = 0.0
+    audio_service.TRENDING_REFRESH_TASK = None
     yield
     audio_service.TRENDING_CACHE["tracks"] = []
     audio_service.TRENDING_CACHE["updated_at"] = 0.0
+    audio_service.TRENDING_CACHE["empty_at"] = 0.0
+    audio_service.TRENDING_REFRESH_TASK = None
 
 
 def test_is_trending_track_rejects_compilations_and_conference_lengths():
@@ -488,11 +504,11 @@ def test_is_trending_track_rejects_compilations_and_conference_lengths():
         return base
 
     assert audio_service._is_trending_track(entry()) is True
-    assert audio_service._is_trending_track(entry(duration=60)) is True
-    assert audio_service._is_trending_track(entry(duration=420)) is True
+    assert audio_service._is_trending_track(entry(duration=90)) is True
+    assert audio_service._is_trending_track(entry(duration=330)) is True
 
-    assert audio_service._is_trending_track(entry(duration=59)) is False
-    assert audio_service._is_trending_track(entry(duration=421)) is False
+    assert audio_service._is_trending_track(entry(duration=89)) is False
+    assert audio_service._is_trending_track(entry(duration=331)) is False
     assert (
         audio_service._is_trending_track(entry(title="Summer Mix 2026"))
         is False
@@ -515,9 +531,7 @@ def test_is_trending_track_rejects_compilations_and_conference_lengths():
         audio_service._is_trending_track(entry(title="Song Live Version"))
         is False
     )
-    assert (
-        audio_service._is_trending_track(entry(duration=None)) is False
-    )
+    assert audio_service._is_trending_track(entry(duration=None)) is False
     assert (
         audio_service._is_trending_track(
             entry(duration=3600, title="Long Stream")
@@ -526,29 +540,45 @@ def test_is_trending_track_rejects_compilations_and_conference_lengths():
     )
 
 
-async def test_trending_stage1_maps_apple_chart_to_youtube_ids(monkeypatch):
+async def test_trending_stage1_maps_yandex_chart_to_youtube_ids(monkeypatch):
     chart_payload = {
-        "feed": {
-            "results": [
-                {"name": "Song One", "artistName": "Artist One"},
-                {"name": "Song Two", "artistName": "Artist Two"},
-                {"name": "", "artistName": "Broken"},
-                {"name": "Song Three", "artistName": ""},
+        "chart": {
+            "tracks": [
+                {
+                    "track": {
+                        "title": "Song One",
+                        "artists": [{"name": "Artist One"}],
+                    }
+                },
+                {
+                    "track": {
+                        "title": "Song Two",
+                        "artists": [{"name": "Artist Two"}],
+                    }
+                },
+                {"track": {"title": "", "artists": [{"name": "Broken"}]}},
+                {"track": {"title": "Song Three", "artists": []}},
             ]
         }
     }
-    responses = {
-        audio_service.TRENDING_URLS[0]: (chart_payload, 200),
-        audio_service.TRENDING_URLS[1]: ({}, 200),
-    }
-    client = FakeChartClient(responses)
+    deezer_urls = [
+        "https://api.deezer.com/search/playlist?q=Топ Россия 2026",
+        "https://api.deezer.com/search/playlist?q=Русские хиты",
+    ]
+    client = FakeChartClient(
+        {
+            audio_service.YANDEX_CHART_URL: (chart_payload, 200),
+            deezer_urls[0]: ({}, 200),
+            deezer_urls[1]: ({}, 200),
+        }
+    )
     monkeypatch.setattr(
         audio_service.httpx, "Client", lambda **kwargs: client
     )
 
     queries = []
     yt_responses = {
-        "ytsearch1:Artist One Song One official audio": {
+        "ytsearch1:Artist One - Song One official audio": {
             "entries": [
                 {
                     "id": "yt_one",
@@ -559,7 +589,7 @@ async def test_trending_stage1_maps_apple_chart_to_youtube_ids(monkeypatch):
                 }
             ]
         },
-        "ytsearch1:Artist Two Song Two official audio": {
+        "ytsearch1:Artist Two - Song Two official audio": {
             "entries": [
                 {
                     "id": "yt_two",
@@ -597,24 +627,25 @@ async def test_trending_falls_back_to_pooled_search(monkeypatch):
     )
 
     queries = []
-    pool_1 = {
-        "entries": [
-            {"id": "ok1", "title": "Hit Song", "duration": 210},
-            {"id": "mix", "title": "Best Mix 2026", "duration": 210},
-            {"id": "hour", "title": "1 Hour of Hits", "duration": 3600},
-            {"id": "ok2", "title": "Another Hit", "duration": 300},
-        ]
-    }
-    pool_2 = {
-        "entries": [
-            {"id": "ok1", "title": "Hit Song", "duration": 210},
-            {"id": "ok3", "title": "Trending Song", "duration": 240},
-        ]
-    }
     fallback_queries = audio_service.TRENDING_FALLBACK_QUERIES
+    # Stage 2 asks one well-known song per query with a tiny pool and takes
+    # exactly one track per query.
     yt_responses = {
-        f"ytsearch35:{fallback_queries[0]}": pool_1,
-        f"ytsearch35:{fallback_queries[1]}": pool_2,
+        f"ytsearch2:{fallback_queries[0]}": {
+            "entries": [
+                {"id": "ok1", "title": "Hit Song", "duration": 210},
+                {"id": "mix", "title": "Best Mix 2026", "duration": 210},
+            ]
+        },
+        f"ytsearch2:{fallback_queries[1]}": {
+            "entries": [
+                {"id": "ok1", "title": "Hit Song", "duration": 210},
+                {"id": "ok3", "title": "Trending Song", "duration": 240},
+            ]
+        },
+        f"ytsearch2:{fallback_queries[2]}": {
+            "entries": [{"id": "ok4", "title": "Third Hit", "duration": 300}]
+        },
     }
     monkeypatch.setattr(
         audio_service.yt_dlp,
@@ -622,65 +653,175 @@ async def test_trending_falls_back_to_pooled_search(monkeypatch):
         lambda params: MultiSearchYDL(yt_responses, queries),
     )
 
-    tracks = await audio_service.get_trending_tracks(limit=10)
+    tracks = await audio_service.get_trending_tracks(limit=3)
 
-    assert [track["track_id"] for track in tracks] == ["ok1", "ok2", "ok3"]
-
-    expected_queries = [
-        f"ytsearch35:{query}" for query in fallback_queries
+    assert [track["track_id"] for track in tracks] == ["ok1", "ok3", "ok4"]
+    assert queries == [
+        f"ytsearch2:{query}" for query in fallback_queries[:3]
     ]
-    assert queries == expected_queries
+
+
+def _fake_refresh_writer(tracks, calls=None):
+    """Build a ``_refresh_trending_cache`` stand-in that persists to cache."""
+
+    async def fake_refresh(limit):
+        if calls is not None:
+            calls.append(limit)
+        if not tracks:
+            return []
+        audio_service.TRENDING_CACHE["tracks"] = list(tracks)
+        audio_service.TRENDING_CACHE["updated_at"] = (
+            audio_service.time.monotonic()
+        )
+        return tracks
+
+    return fake_refresh
 
 
 async def test_trending_cache_is_used_within_ttl(monkeypatch):
-    monkeypatch.setattr(audio_service, "_get_trending_tracks_sync",
-                        lambda limit: [{"track_id": "t1", "title": "T",
-                                        "artist": "A", "duration": 200,
-                                        "thumbnail": None}])
+    calls = []
+    tracks = [
+        {
+            "track_id": "t1",
+            "title": "T",
+            "artist": "A",
+            "duration": 200,
+            "thumbnail": None,
+        }
+    ]
+    monkeypatch.setattr(
+        audio_service, "_refresh_trending_cache", _fake_refresh_writer(tracks, calls)
+    )
 
     first = await audio_service.get_trending_tracks()
     second = await audio_service.get_trending_tracks(limit=20)
 
     assert first == second
     assert first[0]["track_id"] == "t1"
+    assert len(calls) == 1  # the second request was a pure cache hit
+
+
+async def test_trending_stale_cache_served_while_refresh_runs(monkeypatch):
+    """stale-while-revalidate: an expired cache must answer instantly.
+
+    Regression for the tunnel-timeout bug: previously the whole network
+    refresh chain ran while holding the caller, so concurrent /api/trending
+    requests waited dozens of seconds and died at the tunnel.
+    """
+    refresh_started = asyncio.Event()
+    refresh_done = asyncio.Event()
+
+    async def slow_refresh(limit):
+        refresh_started.set()
+        await asyncio.sleep(0.3)
+        tracks = [
+            {
+                "track_id": "refreshed",
+                "title": "T",
+                "artist": "A",
+                "duration": 200,
+                "thumbnail": None,
+            }
+        ]
+        audio_service.TRENDING_CACHE["tracks"] = tracks
+        audio_service.TRENDING_CACHE["updated_at"] = (
+            audio_service.time.monotonic()
+        )
+        refresh_done.set()
+        return tracks
+
+    monkeypatch.setattr(
+        audio_service, "_refresh_trending_cache", slow_refresh
+    )
+
+    audio_service.TRENDING_CACHE["tracks"] = [
+        {
+            "track_id": "stale",
+            "title": "T",
+            "artist": "A",
+            "duration": 200,
+            "thumbnail": None,
+        }
+    ]
+    audio_service.TRENDING_CACHE["updated_at"] = (
+        audio_service.time.monotonic()
+        - audio_service.TRENDING_CACHE_TTL_SECONDS
+        - 1
+    )
+
+    started = time.monotonic()
+    served = await audio_service.get_trending_tracks()
+    assert served[0]["track_id"] == "stale"
+    assert time.monotonic() - started < 0.2  # did not wait for the refresh
+
+    await asyncio.sleep(0)  # let the scheduled refresh task start
+    assert refresh_started.is_set()
+    await asyncio.wait_for(refresh_done.wait(), timeout=2.0)
+    assert audio_service.TRENDING_CACHE["tracks"][0]["track_id"] == "refreshed"
 
 
 async def test_trending_cache_refreshes_after_ttl(monkeypatch):
     calls = []
     clock = {"value": 1000.0}
 
-    def fake_sync(limit):
+    async def fake_refresh(limit):
         calls.append(limit)
-        return [{"track_id": "t1", "title": "T", "artist": "A",
-                 "duration": 200, "thumbnail": None}]
+        tracks = [
+            {
+                "track_id": "t1",
+                "title": "T",
+                "artist": "A",
+                "duration": 200,
+                "thumbnail": None,
+            }
+        ]
+        audio_service.TRENDING_CACHE["tracks"] = tracks
+        audio_service.TRENDING_CACHE["updated_at"] = clock["value"]
+        return tracks
 
-    def fake_monotonic():
-        return clock["value"]
-
-    monkeypatch.setattr(audio_service.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(audio_service, "_get_trending_tracks_sync", fake_sync)
+    monkeypatch.setattr(audio_service.time, "monotonic", lambda: clock["value"])
+    monkeypatch.setattr(
+        audio_service, "_refresh_trending_cache", fake_refresh
+    )
 
     await audio_service.get_trending_tracks()
     await audio_service.get_trending_tracks()
     assert len(calls) == 1
 
-    # Advance past the TTL: the cache must be refreshed once.
+    # Advance past the TTL: serve stale at once, refresh in the background.
     clock["value"] += audio_service.TRENDING_CACHE_TTL_SECONDS + 1
-    await audio_service.get_trending_tracks()
+    stale = await audio_service.get_trending_tracks()
+    assert stale[0]["track_id"] == "t1"
+    await asyncio.sleep(0)  # let the background refresh actually run
     assert len(calls) == 2
 
 
 async def test_trending_keeps_previous_cache_when_refresh_fails(monkeypatch):
     calls = []
 
-    def fake_sync(limit):
+    async def fake_refresh(limit):
         calls.append(limit)
         if len(calls) == 1:
-            return [{"track_id": "cached", "title": "T", "artist": "A",
-                     "duration": 200, "thumbnail": None}]
-        raise RuntimeError("yt-dlp exploded")
+            tracks = [
+                {
+                    "track_id": "cached",
+                    "title": "T",
+                    "artist": "A",
+                    "duration": 200,
+                    "thumbnail": None,
+                }
+            ]
+            audio_service.TRENDING_CACHE["tracks"] = tracks
+            audio_service.TRENDING_CACHE["updated_at"] = (
+                audio_service.time.monotonic()
+            )
+            return tracks
+        # A failed refresh leaves the previous cache untouched.
+        return []
 
-    monkeypatch.setattr(audio_service, "_get_trending_tracks_sync", fake_sync)
+    monkeypatch.setattr(
+        audio_service, "_refresh_trending_cache", fake_refresh
+    )
 
     first = await audio_service.get_trending_tracks()
     audio_service.TRENDING_CACHE["updated_at"] = (
@@ -689,6 +830,7 @@ async def test_trending_keeps_previous_cache_when_refresh_fails(monkeypatch):
         - 1
     )
     second = await audio_service.get_trending_tracks()
+    await asyncio.sleep(0)  # let the (failing) background refresh finish
 
     # A failed refresh keeps serving the previous (stale) list instead of
     # returning an empty trending screen.
@@ -699,19 +841,44 @@ async def test_trending_keeps_previous_cache_when_refresh_fails(monkeypatch):
 
 
 async def test_trending_limits_are_sane(monkeypatch):
-    captured = {}
+    captured = []
 
-    def fake_sync(limit):
-        captured["limit"] = limit
+    async def fake_refresh(limit):
+        captured.append(limit)
         return []
 
-    monkeypatch.setattr(audio_service, "_get_trending_tracks_sync", fake_sync)
+    monkeypatch.setattr(
+        audio_service, "_refresh_trending_cache", fake_refresh
+    )
 
     await audio_service.get_trending_tracks(limit=3)
-    assert captured["limit"] == 3
-
     await audio_service.get_trending_tracks(limit=1000)
-    assert captured["limit"] == audio_service.MAX_SEARCH_RESULTS
-
     await audio_service.get_trending_tracks(limit="bad")
-    assert captured["limit"] == 20
+    assert captured == [3, audio_service.MAX_SEARCH_RESULTS, 20]
+
+
+async def test_trending_empty_result_cooldown_holds(monkeypatch):
+    """A failed/empty refresh records a cooldown: no upstream hammering."""
+    client = FakeChartClient({})
+    monkeypatch.setattr(
+        audio_service.httpx, "Client", lambda **kwargs: client
+    )
+    queries = []
+    monkeypatch.setattr(
+        audio_service.yt_dlp,
+        "YoutubeDL",
+        lambda params: MultiSearchYDL({}, queries),
+    )
+
+    first = await audio_service.get_trending_tracks()
+    assert first == []
+
+    http_calls_after_first = len(client.requested_urls)
+    searches_after_first = len(queries)
+
+    second = await audio_service.get_trending_tracks()
+    assert second == []
+    # The cooldown is honored: no new Yandex/Deezer HTTP calls and no new
+    # yt-dlp searches were issued for the immediate follow-up request.
+    assert len(client.requested_urls) == http_calls_after_first
+    assert len(queries) == searches_after_first

@@ -32,26 +32,81 @@ MAX_TRACK_SECONDS = 900
 SEARCH_POOL_SIZE = 30
 CHUNK_SIZE = 64 * 1024
 
-TRENDING_SEARCH_POOL_SIZE = 35
-TRENDING_MIN_TRACK_SECONDS = 60
-TRENDING_MAX_TRACK_SECONDS = 420
+# Hard ceilings for blocking yt-dlp/httpx work: without them a single wedged
+# upstream call would hold a worker thread (and, for trending, the vendored
+# request path) forever while clients time out through the tunnel.
+SEARCH_TIMEOUT_SECONDS = 30.0
+STREAM_RESOLVE_TIMEOUT_SECONDS = 20.0
+
+TRENDING_RESOLVE_POOL_SIZE = 8
+TRENDING_MIN_TRACK_SECONDS = 90
+TRENDING_MAX_TRACK_SECONDS = 330
 TRENDING_CACHE_TTL_SECONDS = 30 * 60
+# Timeouts for the three stages of a cache refresh (chart fetch, per-song
+# resolution, fallback search). The refresh runs in the background, so these
+# bound how long a wedged refresh can occupy the single-flight slot.
+TRENDING_CHART_TIMEOUT_SECONDS = 20.0
+TRENDING_RESOLVE_TIMEOUT_SECONDS = 30.0
+TRENDING_FALLBACK_TIMEOUT_SECONDS = 45.0
+# A cold (empty) cache must produce at least some answer before the tunnel
+# cuts the request; afterwards the refresh keeps running in the background.
+TRENDING_COLD_WAIT_SECONDS = 15.0
+# When a refresh finished with no tracks, do not re-run the whole network
+# chain on every request for a short cooldown period.
+TRENDING_EMPTY_RETRY_COOLDOWN_SECONDS = 60.0
+
 TRENDING_CACHE_LOCK = asyncio.Lock()
 TRENDING_CACHE: dict[str, Any] = {
     "tracks": [],
     "updated_at": 0.0,
+    "empty_at": 0.0,
 }
-TRENDING_TITLE_EXCLUDE_RE = re.compile(
-    r"\b(?:mix|compilation|1\s+hour|hour|non[-\s]stop|live)\b",
+# Single-flight slot: at most one background refresh exists at a time. The
+# variable is read/written under TRENDING_CACHE_LOCK only.
+TRENDING_REFRESH_TASK: asyncio.Task[list[dict[str, Any]]] | None = None
+# Hard stop-list of title words: chart cutbacks ("Billboard Hot 100 Top 20
+# November 2026"), mixes, compilations, talk shows, reviews and podcasts never
+# pass as single songs (Russian words block "Что не так с Яндекс Музыкой" etc.).
+TITLE_EXCLUDE_RE = re.compile(
+    r"\b(?:"
+    r"billboard|top\s*100|top\s*50|top\s*20|top\s*10|charts?|countdown|"
+    r"compilations?|mix(?:es|tape)?|mashups?|medleys?|playlists?|"
+    r"full\s+album|1\s*hour|one\s+hour|non[-\s]stop|live|"
+    r"обзор|почему|что\s+не\s+так|где\s+слушать|интервью|подкаст|"
+    r"реакция|разбор|плейлист|сборник|микс|чарт|топ\s*\d+"
+    r")\b",
     re.IGNORECASE,
 )
-TRENDING_URLS = (
-    "https://rss.applemarketingtools.com/api/v2/us/music/most-played/20/songs.json",
-    "https://rss.applemarketingtools.com/api/v2/ru/music/most-played/20/songs.json",
+# Real Russian hits chart served by the public Yandex Music feed.
+YANDEX_CHART_URL = "https://music.yandex.ru/handlers/chart.jsx?what=chart&lang=ru"
+# Fast backup source: top Russian playlists on Deezer.
+DEEZER_PLAYLIST_SEARCH_URLS = (
+    "https://api.deezer.com/search/playlist?q=Топ Россия 2026",
+    "https://api.deezer.com/search/playlist?q=Русские хиты",
 )
+# Stage 2 fallback: one specific hit per query, all different artists, so the
+# list never degenerates into several songs by the same performer.
 TRENDING_FALLBACK_QUERIES = (
-    "billboard hot 100 official audio 2026",
-    "youtube music trending official audio",
+    "Баста Моя Мишель - Зима в сердце official audio",
+    "MACAN - ASPHALT 8 official audio",
+    "Три дня дождя - Отпускай official audio",
+    "ANNA ASTI - Царица official audio",
+    "Miyagi Эндшпиль - Silhouette official audio",
+    "XOLIDAYBOY - Пожары official audio",
+    "Женя Трофимов Комната культуры - Поезда official audio",
+    "Моя Мишель - Ветер меняет направление official audio",
+    "Инстасамка - За деньги да official audio",
+    "Король и Шут - Кукла колдуна official audio",
+    "Кино - Группа крови official audio",
+    "Zivert - Life official audio",
+    "Jakone A.V.G - По весне official audio",
+    "Bearwolf - Годзилла official audio",
+    "Монеточка - Это было в России official audio",
+    "Скриптонит - Это любовь official audio",
+    "Мот - Соло official audio",
+    "Ваня Дмитриенко - Венера-Юпитер official audio",
+    "Artik & Asti - Девочка, танцуй official audio",
+    "Гио Пика - Космос official audio",
 )
 
 BROWSER_USER_AGENT = (
@@ -139,6 +194,10 @@ def _entry_duration(entry: Mapping[str, Any]) -> int | None:
 def _is_music_track(entry: Mapping[str, Any]) -> bool:
     """Filter out live streams, Shorts and long mixes."""
     if entry.get("live_status") == "is_live" or entry.get("is_live"):
+        return False
+
+    title = str(entry.get("title") or "").strip()
+    if TITLE_EXCLUDE_RE.search(title):
         return False
 
     duration = _entry_duration(entry)
@@ -234,7 +293,18 @@ async def search_tracks(query: str, limit: int = 15) -> list[dict[str, Any]]:
     safe_limit = max(1, min(safe_limit, MAX_SEARCH_RESULTS))
 
     logger.debug("Searching yt-dlp: query=%r limit=%d", cleaned_query, safe_limit)
-    return await asyncio.to_thread(_search_tracks_sync, cleaned_query, safe_limit)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_search_tracks_sync, cleaned_query, safe_limit),
+            timeout=SEARCH_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError as exc:
+        raise AudioServiceError(
+            f"Поиск занял слишком много времени и был прерван: "
+            f"{cleaned_query!r}"
+        ) from exc
 
 
 # ------------------------------------------------------------------ trending
@@ -256,7 +326,7 @@ def _is_trending_track(entry: Mapping[str, Any]) -> bool:
         return False
 
     title = str(entry.get("title") or "").strip()
-    if TRENDING_TITLE_EXCLUDE_RE.search(title):
+    if TITLE_EXCLUDE_RE.search(title):
         return False
     return True
 
@@ -267,7 +337,10 @@ def _entry_to_track(entry: Mapping[str, Any]) -> dict[str, Any]:
         "track_id": str(entry.get("id") or "").strip(),
         "title": str(entry.get("title") or "").strip(),
         "artist": str(
-            entry.get("uploader") or entry.get("channel") or entry.get("artist")
+            entry.get("uploader")
+            or entry.get("channel")
+            or entry.get("artist")
+            or ""
         ).strip(),
         "duration": _coerce_duration(entry.get("duration")),
         "thumbnail": _best_thumbnail(entry),
@@ -275,7 +348,7 @@ def _entry_to_track(entry: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _chart_track_from_entry(item: Mapping[str, Any], entry: Mapping[str, Any]):
-    """Use Apple chart metadata, but resolve the playable YouTube id here."""
+    """Use Deezer/Apple chart metadata, but resolve the playable YouTube id here."""
     if not _is_trending_track(entry):
         return None
 
@@ -287,58 +360,174 @@ def _chart_track_from_entry(item: Mapping[str, Any], entry: Mapping[str, Any]):
         "track_id": track_id,
         "title": str(item.get("title") or entry.get("title") or "").strip(),
         "artist": str(
-            item.get("artistName")
-            or item.get("artist")
+            item.get("artist")
             or entry.get("uploader")
             or entry.get("channel")
+            or ""
         ).strip(),
         "duration": _coerce_duration(entry.get("duration")),
         "thumbnail": _best_thumbnail(entry),
     }
 
 
-def _fetch_apple_chart_sync(
-    limit: int,
-    *,
-    client: httpx.Client | None = None,
-) -> list[Mapping[str, Any]]:
-    """Return chart items (name/artist) for the real Apple Music feed."""
+def _fetch_yandex_chart_sync(limit: int) -> list[dict[str, str]]:
+    """Return the real Russian hits chart from the public Yandex Music feed."""
     if limit <= 0:
         return []
 
-    owns_client = client is None
-    if client is None:
-        client = httpx.Client(timeout=STREAM_TIMEOUT)
-
-    entries: list[Mapping[str, Any]] = []
     try:
-        for url in TRENDING_URLS:
-            try:
-                response = client.get(
-                    url,
-                    headers={
-                        "Accept": "application/json",
-                        "User-Agent": BROWSER_USER_AGENT,
-                    },
-                )
-                response.raise_for_status()
-                feed = response.json()
-            except Exception:
-                logger.debug("Apple trending feed failed: %s", url, exc_info=True)
-                continue
+        with httpx.Client(timeout=STREAM_TIMEOUT) as client:
+            response = client.get(
+                YANDEX_CHART_URL,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": BROWSER_USER_AGENT,
+                    "Referer": "https://music.yandex.ru/",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        logger.debug("Yandex chart failed: %s", YANDEX_CHART_URL, exc_info=True)
+        return []
 
-            results = feed.get("feed", {}).get("results") or []
-            if isinstance(results, list):
-                entries.extend(
-                    item for item in results if isinstance(item, Mapping)
-                )
-            if len(entries) >= limit:
-                break
-    finally:
-        if owns_client:
-            client.close()
+    entries: Any = None
+    if isinstance(payload, Mapping):
+        chart = payload.get("chart")
+        if isinstance(chart, Mapping):
+            entries = chart.get("tracks")
+        if not isinstance(entries, list):
+            entries = payload.get("tracks")
+    if not isinstance(entries, list):
+        return []
 
-    return entries[:limit]
+    items: list[dict[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        track = entry.get("track")
+        track = track if isinstance(track, Mapping) else entry
+        title = str(track.get("title") or track.get("name") or "").strip()
+        artists = track.get("artists")
+        artist_name = ""
+        if isinstance(artists, list):
+            for artist in artists:
+                if isinstance(artist, Mapping) and artist.get("name"):
+                    artist_name = str(artist["name"]).strip()
+                    break
+        if not artist_name or not title:
+            continue
+        items.append({"artist": artist_name, "title": title})
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _fetch_deezer_ru_playlist_sync(limit: int) -> list[dict[str, str]]:
+    """Take Russian-chart tracks from a top Russian Deezer playlist."""
+    if limit <= 0:
+        return []
+
+    try:
+        with httpx.Client(timeout=STREAM_TIMEOUT) as client:
+            playlist_id: int | None = None
+            headers = {
+                "Accept": "application/json",
+                "User-Agent": BROWSER_USER_AGENT,
+            }
+            for search_url in DEEZER_PLAYLIST_SEARCH_URLS:
+                try:
+                    response = client.get(search_url, headers=headers)
+                    response.raise_for_status()
+                    results = response.json().get("data") or []
+                except Exception:
+                    logger.debug(
+                        "Deezer playlist search failed: %s",
+                        search_url,
+                        exc_info=True,
+                    )
+                    continue
+                first = next(
+                    (
+                        item.get("id")
+                        for item in results
+                        if isinstance(item, Mapping) and item.get("id") is not None
+                    ),
+                    None,
+                )
+                if first is not None:
+                    playlist_id = int(first)
+                    break
+
+            if not playlist_id:
+                return []
+
+            response = client.get(
+                f"https://api.deezer.com/playlist/{playlist_id}"
+                f"/tracks?limit={max(limit, 30)}",
+                headers=headers,
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        logger.debug("Deezer RU playlist failed", exc_info=True)
+        return []
+
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return []
+
+    def _has_cyrillic(text: str) -> bool:
+        return bool(re.search(r"[а-яё]", text, re.IGNORECASE))
+
+    items: list[dict[str, str]] = []
+    for wrapped in data:
+        if not isinstance(wrapped, Mapping):
+            continue
+        track = wrapped.get("track")
+        track = track if isinstance(track, Mapping) else wrapped
+        artist = track.get("artist")
+        artist_name = (
+            str(artist.get("name") or "").strip()
+            if isinstance(artist, Mapping)
+            else ""
+        )
+        title_name = str(track.get("title") or "").strip()
+        if not artist_name or not title_name:
+            continue
+        # Keep only tracks that clearly belong to the Russian chart.
+        if not _has_cyrillic(title_name) and not _has_cyrillic(artist_name):
+            continue
+        items.append({"artist": artist_name, "title": title_name})
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _get_chart_items_sync(limit: int) -> list[dict[str, str]]:
+    """Real single songs, stage 1: Yandex RU chart first, Deezer RU playlist as fallback."""
+    items = _fetch_yandex_chart_sync(limit)
+    remaining = limit - len(items)
+    if remaining <= 0:
+        return items[:limit]
+
+    seen: set[tuple[str, str]] = {
+        (item["artist"].lower(), item["title"].lower()) for item in items
+    }
+    for raw_item in _fetch_deezer_ru_playlist_sync(remaining):
+        title = str(raw_item.get("title") or "").strip()
+        artist = str(raw_item.get("artist") or "").strip()
+        if not title or not artist:
+            continue
+        # Yandex and the Deezer playlist can host the same song.
+        key = (artist.lower(), title.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({"artist": artist, "title": title})
+        if len(items) >= limit:
+            break
+    return items[:limit]
 
 
 def _yt_search_entries_sync(query: str, pool: int) -> list[Mapping[str, Any]]:
@@ -369,69 +558,80 @@ def _yt_search_entries_sync(query: str, pool: int) -> list[Mapping[str, Any]]:
     return [entry for entry in entries if isinstance(entry, Mapping)]
 
 
-def _get_trending_from_chart_sync(limit: int) -> list[dict[str, Any]]:
-    """Stage 1: resolve real Apple Music top songs into playable YouTube IDs."""
-    if limit <= 0:
-        return []
+def _resolve_chart_track_sync(
+    item: Mapping[str, str], query: str
+) -> dict[str, Any] | None:
+    """One yt-search for a chart song -> track with a real YouTube id."""
+    entries = _yt_search_entries_sync(query, 1)
+    for entry in entries:
+        candidate = _chart_track_from_entry(item, entry)
+        if candidate:
+            return candidate
+    return None
 
-    chart_items = _fetch_apple_chart_sync(max(limit, TRENDING_SEARCH_POOL_SIZE))
-    chart_items = [_get_chart_item(item) for item in chart_items]
-    chart_items = list(filter(None, chart_items))
+
+async def _resolve_chart_items(
+    chart_items: list[dict[str, str]], limit: int
+) -> list[dict[str, Any]]:
+    """Resolve chart songs into playable YouTube ids, 8 lookups in parallel."""
+    semaphore = asyncio.Semaphore(TRENDING_RESOLVE_POOL_SIZE)
+
+    async def resolve(item: Mapping[str, str]):
+        query = f"{item['artist']} - {item['title']} official audio"
+        async with semaphore:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(_resolve_chart_track_sync, item, query),
+                    timeout=TRENDING_RESOLVE_TIMEOUT_SECONDS,
+                )
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.debug(
+                    "Trending resolve timed out: %r", item.get("title")
+                )
+                return None
+            except AudioServiceError:
+                return None
+            except Exception:
+                logger.exception(
+                    "Unexpected trending search failure: %r", item.get("title")
+                )
+                return None
+
+    candidates = await asyncio.gather(*(resolve(item) for item in chart_items))
 
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in chart_items:
-        remaining = limit - len(results)
-        if remaining <= 0:
-            break
-        try:
-            # A single result per chart entry is enough for trending: the
-            # Apple chart itself already contains real, recent songs.
-            entries = _yt_search_entries_sync(
-                f"{item['artist']} {item['title']} official audio", 1
-            )
-        except AudioServiceError:
+    artist_counts: dict[str, int] = {}
+    for candidate in candidates:
+        if not candidate:
             continue
-        except Exception:
-            logger.exception("Unexpected trending search failure: %r", item["title"])
+        track_id = candidate["track_id"]
+        if not track_id or track_id in seen:
             continue
-
-        for entry in entries:
-            candidate = _chart_track_from_entry(item, entry)
-            if not candidate:
-                continue
-            if candidate["track_id"] in seen:
-                continue
-            seen.add(candidate["track_id"])
-            results.append(candidate)
-            break
-
+        # Diversity cap: at most 2 songs from the same artist in the list.
+        artist_key = str(candidate.get("artist") or "").strip().lower()
+        if artist_key and artist_counts.get(artist_key, 0) >= 2:
+            continue
+        if artist_key:
+            artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
+        seen.add(track_id)
+        results.append(candidate)
         if len(results) >= limit:
             break
-
-    return results[:limit]
-
-
-def _get_chart_item(item: Mapping[str, Any]) -> dict[str, str] | None:
-    """Validate one Apple chart item and build a yt-dlp search query."""
-    title = str(item.get("name") or "").strip()
-    artist = str(item.get("artistName") or "").strip()
-    if not title or not artist:
-        return None
-    return {"artist": artist, "title": title}
+    return results
 
 
 def _get_trending_from_search_sync(limit: int) -> list[dict[str, Any]]:
-    """Stage 2: the pooled search when the Apple chart cannot be mapped."""
+    """Stage 2: one specific RU hit per query so the list stays varied."""
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
+    artist_counts: dict[str, int] = {}
     for query in TRENDING_FALLBACK_QUERIES:
         if len(results) >= limit:
             break
         try:
-            entries = _yt_search_entries_sync(
-                query, TRENDING_SEARCH_POOL_SIZE
-            )
+            # A tiny pool is enough: each query is one well-known song.
+            entries = _yt_search_entries_sync(query, 2)
         except AudioServiceError:
             continue
         except Exception:
@@ -439,15 +639,21 @@ def _get_trending_from_search_sync(limit: int) -> list[dict[str, Any]]:
             continue
 
         for entry in entries:
-            if not _is_trending_track(entry):
+            if not isinstance(entry, Mapping) or not _is_trending_track(entry):
                 continue
             track = _entry_to_track(entry)
-            if not track["track_id"] or track["track_id"] in seen:
+            track_id = track["track_id"]
+            if not track_id or track_id in seen:
                 continue
-            seen.add(track["track_id"])
+            # Diversity cap: at most 2 songs from the same artist.
+            artist_key = str(track.get("artist") or "").strip().lower()
+            if artist_key and artist_counts.get(artist_key, 0) >= 2:
+                continue
+            if artist_key:
+                artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
+            seen.add(track_id)
             results.append(track)
-            if len(results) >= limit:
-                break
+            break
 
     return results[:limit]
 
@@ -469,30 +675,75 @@ def _merge_by_track_id(
     return merged
 
 
-def _get_trending_tracks_sync(limit: int) -> list[dict[str, Any]]:
-    """Try the real chart first, then fall back to a yt-dlp search."""
-    if limit <= 0:
+async def _refresh_trending_cache(limit: int) -> list[dict[str, Any]]:
+    """Fetch and resolve a fresh trending list WITHOUT holding the cache lock.
+
+    This is the single-flight refresh body. It never blocks other requests on
+    the lock while doing network work; the cache state is updated under the
+    lock only after a successful fetch. On failure (or an empty result) the
+    previous cache is left untouched and a short "empty" cooldown is recorded
+    so that requests stop re-running the whole network chain.
+    """
+    tracks: list[dict[str, Any]] = []
+    try:
+        chart_items = await asyncio.wait_for(
+            asyncio.to_thread(
+                # Ask the chart source for extra entries: some fail the
+                # resolve step, so a larger pool keeps the list full.
+                _get_chart_items_sync,
+                max(limit, 25),
+            ),
+            timeout=TRENDING_CHART_TIMEOUT_SECONDS,
+        )
+        tracks = await _resolve_chart_items(chart_items, limit)
+        if len(tracks) < limit:
+            fallback_tracks = await asyncio.wait_for(
+                asyncio.to_thread(_get_trending_from_search_sync, limit),
+                timeout=TRENDING_FALLBACK_TIMEOUT_SECONDS,
+            )
+            tracks = _merge_by_track_id(tracks, fallback_tracks, limit)
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        logger.warning("Trending refresh timed out")
+    except Exception:
+        logger.exception("Trending fetch failed")
+
+    if not tracks:
+        logger.warning("Trending sources did not return any tracks")
+        async with TRENDING_CACHE_LOCK:
+            TRENDING_CACHE["empty_at"] = time.monotonic()
         return []
 
-    chart_tracks = _get_trending_from_chart_sync(limit)
-    if len(chart_tracks) >= limit:
-        return chart_tracks[:limit]
-
-    fallback_tracks = _get_trending_from_search_sync(limit)
-    tracks = _merge_by_track_id(chart_tracks, fallback_tracks, limit)
-    if not tracks:
-        # The chart can return 0 items when Apple is unavailable, but the
-        # search stage should at least give something to keep the UI alive.
-        return _get_trending_from_search_sync(limit)
+    async with TRENDING_CACHE_LOCK:
+        TRENDING_CACHE["tracks"] = list(tracks)
+        TRENDING_CACHE["updated_at"] = time.monotonic()
+        TRENDING_CACHE["empty_at"] = 0.0
     return tracks
 
 
-async def get_trending_tracks(limit: int = 20) -> list[dict[str, Any]]:
-    """Return the cached trending list, refreshing at most once per 30 min.
+def _start_trending_refresh_locked(limit: int) -> asyncio.Task[list[dict[str, Any]]]:
+    """Create the (single) trending refresh task. Must hold the cache lock."""
+    task = asyncio.create_task(
+        _refresh_trending_cache(limit), name="trending-refresh"
+    )
+    global TRENDING_REFRESH_TASK
+    TRENDING_REFRESH_TASK = task
+    return task
 
-    The cache is intentionally kept across requests even after a transient
-    upstream failure, so the frontend never sees an empty screen unless this
-    is a cold start with no prior successful fetch.
+
+async def get_trending_tracks(limit: int = 20) -> list[dict[str, Any]]:
+    """Return the trending list using stale-while-revalidate.
+
+    Semantics:
+
+    * fresh cache -> served immediately, no network work;
+    * stale cache -> served immediately while one background task refreshes
+      it (single-flight: concurrent callers never trigger duplicate
+      refreshes, and slow refreshes no longer block this request);
+    * cold cache  -> waits a bounded time for the in-flight refresh, then
+      gives up without holding anything so the request cannot hit the
+      tunnel timeout; the refresh keeps running and fills the cache.
     """
     try:
         safe_limit = int(limit)
@@ -500,28 +751,60 @@ async def get_trending_tracks(limit: int = 20) -> list[dict[str, Any]]:
         safe_limit = 20
 
     safe_limit = max(1, min(safe_limit, MAX_SEARCH_RESULTS))
+    global TRENDING_REFRESH_TASK
+
     async with TRENDING_CACHE_LOCK:
-        cached = TRENDING_CACHE["tracks"]
-        if (
-            cached
-            and time.monotonic() - TRENDING_CACHE["updated_at"]
-            <= TRENDING_CACHE_TTL_SECONDS
-        ):
-            return list(cached)[:safe_limit]
+        cached = list(TRENDING_CACHE["tracks"])
+        cache_age = time.monotonic() - TRENDING_CACHE["updated_at"]
 
-        try:
-            tracks = await asyncio.to_thread(_get_trending_tracks_sync, safe_limit)
-        except Exception:
-            logger.exception("Trending fetch failed")
-            return list(cached)[:safe_limit]
+        task = TRENDING_REFRESH_TASK
+        if task is not None and task.done():
+            # Reap the finished refresh; its result is already in the cache.
+            task = None
 
-        if not tracks:
-            logger.warning("Trending sources did not return any tracks")
-            return list(cached)[:safe_limit]
+        if task is None:
+            empty_age = time.monotonic() - TRENDING_CACHE["empty_at"]
+            # The previous refresh returned nothing: throttle retries per cooldown.
+            recently_empty = (
+                TRENDING_CACHE["empty_at"] > 0
+                and empty_age < TRENDING_EMPTY_RETRY_COOLDOWN_SECONDS
+            )
+            if cached and cache_age <= TRENDING_CACHE_TTL_SECONDS:
+                return cached[:safe_limit]
+            if recently_empty:
+                # No data and the last refresh just failed: honor the cooldown
+                # instead of hammering the upstream sources every request.
+                return cached[:safe_limit]
+            task = _start_trending_refresh_locked(safe_limit)
 
-        TRENDING_CACHE["tracks"] = tracks
-        TRENDING_CACHE["updated_at"] = time.monotonic()
-        return tracks[:safe_limit]
+        # Stale-while-revalidate: keep serving the previous list even when it
+        # is older than the TTL, so the frontend never blocks on the refresh.
+        if cached:
+            return cached[:safe_limit]
+
+    # Cold start with an empty cache: wait a bounded time for the refresh.
+    # asyncio.shield keeps the background task alive on timeout/cancellation.
+    try:
+        tracks = await asyncio.wait_for(
+            asyncio.shield(task), timeout=TRENDING_COLD_WAIT_SECONDS
+        )
+    except asyncio.CancelledError:
+        if task.cancelled():
+            # The refresh itself was cancelled (e.g. shutdown), not us.
+            return cached[:safe_limit]
+        raise
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Cold trending refresh did not finish in %.0fs; "
+            "it continues in the background",
+            TRENDING_COLD_WAIT_SECONDS,
+        )
+        return cached[:safe_limit]
+    except Exception:
+        logger.exception("Trending refresh task failed unexpectedly")
+        return cached[:safe_limit]
+
+    return list(tracks)[:safe_limit]
 
 
 # ---------------------------------------------------------------- stream URL
@@ -597,9 +880,18 @@ async def get_audio_stream_url(track_id: str) -> str:
     if not cleaned_track_id:
         raise ValueError("track_id is required")
 
-    return await asyncio.to_thread(
-        _get_audio_stream_url_sync, cleaned_track_id
-    )
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_get_audio_stream_url_sync, cleaned_track_id),
+            timeout=STREAM_RESOLVE_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError as exc:
+        raise AudioServiceError(
+            f"Не удалось получить аудиопоток для {cleaned_track_id!r}: "
+            f"превышен лимит времени"
+        ) from exc
 
 
 # -------------------------------------------------------------------- proxying

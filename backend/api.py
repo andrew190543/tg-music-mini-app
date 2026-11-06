@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Callable
@@ -18,6 +20,7 @@ from config import BASE_DIR, load_settings
 
 from .audio_service import (
     AudioServiceError,
+    AudioStream,
     get_audio_stream_url,
     get_trending_tracks,
     search_tracks,
@@ -26,6 +29,7 @@ from .audio_service import (
 from .db import Database
 
 APP_VERSION = "0.1.0"
+logger = logging.getLogger(__name__)
 
 LifespanFactory = Callable[[FastAPI], AbstractAsyncContextManager[None]]
 
@@ -87,9 +91,18 @@ def create_app(
         database = Database(resolved_db_path)
         await database.connect()
         app.state.db = database
+
+        # Warm the trending cache right after the loop starts: the chart
+        # fetches and yt-dlp lookups take tens of seconds, so without this
+        # the very first /api/trending request hits the tunnel timeout and
+        # the Mini App shows "Ошибка загрузки". From now on it is usually
+        # served from the hot cache.
+        warm_task = asyncio.create_task(get_trending_tracks(20))
+
         try:
             yield
         finally:
+            warm_task.cancel()
             await database.close()
 
     app = FastAPI(
@@ -174,26 +187,69 @@ def create_app(
         return await get_trending_tracks(limit=limit)
     @app.get("/api/stream/{track_id}", tags=["music"])
     async def stream(track_id: str, request: Request) -> StreamingResponse:
-        """Resolve the direct audio URL and proxy it with Range support."""
+        """Resolve the direct audio URL and proxy it with Range support.
+
+        YouTube-signed URLs expire after a while, so a 401/403/410 from the
+        CDN triggers one fresh yt-dlp re-resolution before the endpoint gives
+        up (browsers surface 502 without retrying on their own).
+        """
         cleaned_track_id = track_id.strip()
         if not cleaned_track_id:
             raise HTTPException(status_code=422, detail="track_id is required")
 
-        try:
-            direct_url = await get_audio_stream_url(cleaned_track_id)
-            audio = await start_audio_stream(
-                direct_url, request.headers.get("range")
-            )
-        except AudioServiceError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 416:
+        range_header = request.headers.get("range")
+        audio: AudioStream | None = None
+        last_error: Exception | None = None
+
+        for attempt in (1, 2):
+            try:
+                direct_url = await get_audio_stream_url(cleaned_track_id)
+                audio = await start_audio_stream(direct_url, range_header)
+                break
+            except AudioServiceError as exc:
+                last_error = exc
+                if attempt == 1 and isinstance(
+                    exc.__cause__, asyncio.TimeoutError
+                ):
+                    # A timed-out yt-dlp resolution is likely transient
+                    # (network hiccup); a plain resolve failure (removed
+                    # video, etc.) is not worth the extra latency.
+                    logger.warning(
+                        "Stream resolve timed out for %r, retrying once",
+                        cleaned_track_id,
+                    )
+                    continue
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 416:
+                    raise HTTPException(
+                        status_code=416,
+                        detail="Requested range not satisfiable",
+                    ) from exc
+                if (
+                    exc.response.status_code in (401, 403, 410)
+                    and attempt == 1
+                ):
+                    # The signed URL is almost certainly stale: force a
+                    # fresh yt-dlp resolution instead of failing playback.
+                    logger.warning(
+                        "Upstream %d for %r; re-resolving the signed URL",
+                        exc.response.status_code,
+                        cleaned_track_id,
+                    )
+                    last_error = exc
+                    continue
+                last_error = exc
+                break
+
+        if audio is None:
+            if isinstance(last_error, httpx.HTTPStatusError):
                 raise HTTPException(
-                    status_code=416, detail="Requested range not satisfiable"
-                ) from exc
+                    status_code=502,
+                    detail="Upstream audio server returned an error",
+                ) from last_error
             raise HTTPException(
-                status_code=502, detail="Upstream audio server returned an error"
-            ) from exc
+                status_code=502, detail=str(last_error)
+            ) from last_error
 
         headers = dict(audio.headers)
         headers.setdefault("Accept-Ranges", "bytes")

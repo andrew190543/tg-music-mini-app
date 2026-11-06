@@ -85,6 +85,9 @@
     let lastAudibleVolume = 1;
     let isSeeking = false;
     let lastPositionUpdate = 0;
+    // Timestamp of the last user-driven volume change: the async
+    // CloudStorage restore must not overwrite a newer local decision.
+    let lastUserVolumeChange = 0;
 
     PlayerState.volume = readStoredVolume();
     lastAudibleVolume = PlayerState.volume > 0 ? PlayerState.volume : 1;
@@ -189,6 +192,44 @@
             window.localStorage.setItem(VOLUME_STORAGE_KEY, String(value));
         } catch {
             // Ignore storage errors: volume still works for this session.
+        }
+
+        // Telegram CloudStorage survives tunnel/domain changes, so it mirrors
+        // localStorage as the more durable backup for the saved volume.
+        try {
+            tg?.CloudStorage?.setItem?.(VOLUME_STORAGE_KEY, String(value));
+        } catch {
+            // CloudStorage may be unavailable outside Telegram.
+        }
+    }
+
+    function restoreCloudVolume() {
+        try {
+            if (typeof tg?.CloudStorage?.getItem !== "function") {
+                return;
+            }
+            const startedAt = Date.now();
+            tg.CloudStorage.getItem(VOLUME_STORAGE_KEY, (err, val) => {
+                if (err || val === null || val === undefined) {
+                    return;
+                }
+                const value = Number(val);
+                if (
+                    !Number.isFinite(value) ||
+                    value < 0 ||
+                    value > 1 ||
+                    // The user already picked a volume while the async
+                    // Telegram CloudStorage lookup was in flight: the local
+                    // decision wins, otherwise this callback fires late and
+                    // silently reverts the slider.
+                    lastUserVolumeChange > startedAt
+                ) {
+                    return;
+                }
+                setVolume(value, { persist: true, source: "cloud" });
+            });
+        } catch {
+            // CloudStorage may be unavailable outside Telegram.
         }
     }
 
@@ -1222,6 +1263,9 @@
 
         audio.src = `/api/stream/${encodeURIComponent(track.track_id)}`;
         audio.load();
+        // Loading a new source can reset the element volume, so reapply
+        // the persisted value before playback starts.
+        audio.volume = PlayerState.volume;
         updateMediaSession(track);
         updatePositionState(0, 0, true);
 
@@ -1489,8 +1533,11 @@
         }
     }
 
-    function setVolume(value, { persist = true } = {}) {
+    function setVolume(value, { persist = true, source = "user" } = {}) {
         const next = clamp(Number(value) || 0, 0, 1);
+        if (source === "user") {
+            lastUserVolumeChange = Date.now();
+        }
         PlayerState.volume = next;
         audio.volume = next;
 
@@ -1654,6 +1701,10 @@
     /* ---------- Audio element events ---------- */
 
     audio.addEventListener("play", () => {
+        if (Math.abs(audio.volume - PlayerState.volume) > 0.001) {
+            // Some browsers drop the volume when the source is replaced.
+            audio.volume = PlayerState.volume;
+        }
         PlayerState.isPlaying = true;
         renderPlayState();
         setMediaPlaybackState("playing");
@@ -1680,12 +1731,11 @@
     audio.addEventListener("error", handleAudioError);
 
     audio.addEventListener("volumechange", () => {
-        const value = clamp(audio.volume, 0, 1);
-        if (Math.abs(value - PlayerState.volume) > 0.001) {
-            PlayerState.volume = value;
-            if (value > 0) {
-                lastAudibleVolume = value;
-            }
+        // Never adopt a lowered element volume: metadata loading can silently
+        // reset audio.volume, so the stored value always wins instead.
+        const value = clamp(PlayerState.volume, 0, 1);
+        if (Math.abs(audio.volume - value) > 0.001) {
+            audio.volume = value;
             syncVolumeUI();
         }
     });
@@ -1909,6 +1959,7 @@
     setupMarquee();
     setupMediaSession();
     checkApi();
+    restoreCloudVolume();
     syncVolumeUI();
     loadFavorites();
 

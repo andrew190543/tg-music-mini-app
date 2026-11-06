@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -15,6 +16,7 @@ from aiogram.types import BotCommand
 from fastapi import FastAPI
 
 from backend.api import create_app
+from backend.audio_service import get_trending_tracks
 from backend.db import close_db, init_db
 from bot.handlers import build_router, configure_menu_button
 from config import get_webapp_url, load_settings
@@ -38,31 +40,57 @@ def _build_bot_runtime() -> tuple[Bot, Dispatcher] | None:
 
 
 async def _run_bot_polling(bot: Bot, dispatcher: Dispatcher) -> None:
-    """Configure the bot and poll Telegram without taking down the API."""
-    try:
+    """Configure the bot and poll Telegram, restarting after failures.
+
+    Polling must not take down the API and must not die silently either: a
+    transient network failure makes aiogram exit, so wrap it in a bounded
+    backoff loop (worst-case the bot comes back after 30 seconds).
+    """
+    delay = 1.0
+    while True:
+        started = time.monotonic()
         try:
-            await bot.set_my_commands(
-                [BotCommand(command="start", description="Открыть плеер")]
+            try:
+                await bot.set_my_commands(
+                    [BotCommand(command="start", description="Открыть плеер")]
+                )
+            except Exception:
+                logger.warning(
+                    "Не удалось обновить команды бота", exc_info=True
+                )
+
+            await configure_menu_button(bot, get_webapp_url())
+
+            # uvicorn owns process signals in embedded mode; the bot must not
+            # install its own SIGINT/SIGTERM handlers or close the shared session.
+            await dispatcher.start_polling(
+                bot,
+                allowed_updates=dispatcher.resolve_used_update_types(),
+                handle_signals=False,
+                close_bot_session=False,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:
+            logger.exception(
+                "Polling Telegram прерван; перезапуск через %.0f сек", delay
+            )
+        else:
             logger.warning(
-                "Не удалось обновить команды бота", exc_info=True
+                "Polling Telegram завершился штатно; перезапуск через %.0f сек",
+                delay,
             )
 
-        await configure_menu_button(bot, get_webapp_url())
+        # A long-lived poll run resets the backoff: the connection itself
+        # worked, so the next failure is probably unrelated.
+        if time.monotonic() - started >= 60.0:
+            delay = 1.0
 
-        # uvicorn owns process signals in embedded mode; the bot must not
-        # install its own SIGINT/SIGTERM handlers or close the shared session.
-        await dispatcher.start_polling(
-            bot,
-            allowed_updates=dispatcher.resolve_used_update_types(),
-            handle_signals=False,
-            close_bot_session=False,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("Telegram-бот остановлен; API продолжает работу")
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        delay = min(delay * 2.0, 30.0)
 
 
 def _print_player_url() -> None:
@@ -93,6 +121,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     _print_player_url()
 
+    # Warm the trending cache in the background: the chart fetches and
+    # yt-dlp lookups take tens of seconds, so without this the very first
+    # /api/trending request would block on the whole network chain.
+    warm_task: asyncio.Task[list[dict]] | None = asyncio.create_task(
+        get_trending_tracks(20), name="trending-warmup"
+    )
+
     bot_task: asyncio.Task[None] | None = None
     bot: Bot | None = None
 
@@ -121,6 +156,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if warm_task is not None:
+            warm_task.cancel()
+            await asyncio.gather(warm_task, return_exceptions=True)
         if bot_task is not None:
             bot_task.cancel()
             await asyncio.gather(bot_task, return_exceptions=True)
