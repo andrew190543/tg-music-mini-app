@@ -38,7 +38,6 @@
 
     /* ---------- DOM ---------- */
 
-    const badge = document.getElementById("api-badge");
     const searchInput = document.getElementById("search-input");
     const clearSearch = document.getElementById("clear-search");
     const tabs = document.querySelectorAll("[data-tab]");
@@ -101,7 +100,7 @@
     const playerCover = document.getElementById("player-cover");
     const playerTitle = document.getElementById("player-title");
     const playerArtist = document.getElementById("player-artist");
-    const playerSource = document.querySelector(".full-player__source");
+    const playerEyebrow = document.getElementById("player-eyebrow");
     const fullLike = document.getElementById("full-like");
 
     /* ---------- Player state ---------- */
@@ -462,37 +461,6 @@
         }
     }
 
-    /* ---------- API status ---------- */
-
-    function setBadge(state, text) {
-        if (!badge) {
-            return;
-        }
-        badge.className = `badge badge--${state}`;
-        badge.textContent = text;
-    }
-
-    async function checkApi() {
-        setBadge("pending", "Проверка…");
-
-        try {
-            const response = await fetch("/api/health", {
-                cache: "no-store",
-                headers: { Accept: "application/json" },
-            });
-            const data = await response.json();
-
-            if (!response.ok || data.status !== "ok") {
-                throw new Error(`API status: ${response.status}`);
-            }
-
-            setBadge("ok", "API онлайн");
-        } catch (error) {
-            console.error("Health check failed:", error);
-            setBadge("error", "API офлайн");
-        }
-    }
-
     /* ---------- Telegram init & theme ---------- */
 
     function applyTheme() {
@@ -532,6 +500,8 @@
 
     /* ---------- Tabs ---------- */
 
+    let activeTab = "search";
+
     function activateTab(name) {
         // Cancels a pending delayed hide and closes the live block: switching
         // tabs must never leave a stale timer collapsing the panel later.
@@ -546,6 +516,32 @@
         // switch (and so no delayed blur does it for us at a bad moment).
         searchInput?.blur();
 
+        activeTab = name;
+        setSearchPlaceholder(name);
+        // The field text is shared between the tabs and must survive any
+        // switch: a stale-input/invisible-clear mismatch would strand the
+        // user in old search results.
+        syncClearButton();
+
+        if (name === "library") {
+            // The current field text immediately acts as the local filter
+            // for the library (favorites / playlists / open playlist).
+            libraryFilter = searchInput?.value ? searchInput.value : "";
+        } else if (name === "search") {
+            const query = searchInput?.value.trim() || "";
+            if (!query) {
+                // An empty field always shows the trending catalog — never
+                // leave stale search results on screen.
+                restorePopular();
+            } else if (query !== lastOnlineSearchQuery) {
+                // The text was typed outside the search tab (or an exact
+                // search for it never ran): perform it now.
+                performSearch(query);
+            }
+            // Otherwise the results for this exact query are already on
+            // screen: keep them, the field text and the clear button.
+        }
+
         tabs.forEach((tab) => {
             const active = tab.dataset.tab === name;
             tab.classList.toggle("is-active", active);
@@ -559,8 +555,9 @@
         });
 
         if (name === "library") {
-            // Show the cached list instantly, then refresh it from SQLite.
-            renderLibrary();
+            // Re-render through the filter so the cached lists respect the
+            // current field text, then refresh from SQLite in the background.
+            applyLibraryFilter();
             loadFavorites({ force: true });
             if (playlistsLoaded) {
                 // Counts may have changed since the last visit.
@@ -593,6 +590,32 @@
     // /api/trending). A new request cancels the previous one so fast typing
     // does not leave several yt-dlp lookups running on the backend.
     let activeListAbort = null;
+
+    /* --- Contextual search state -----------------------------------
+       The field works differently per active tab: in "Поиск" it queries
+       the internet (/api/search), in "Моя музыка" it only filters the
+       local collections client-side. The text itself stays in the field
+       across tab switches and serves both modes. */
+    let libraryFilter = "";
+
+    // The exact query whose results are currently rendered in the search
+    // tab ("" = the trending catalog). Set by performSearch/restorePopular
+    // so switching tabs never re-requests an already shown answer.
+    let lastOnlineSearchQuery = "";
+
+    function setSearchPlaceholder(name) {
+        if (!searchInput) {
+            return;
+        }
+        searchInput.placeholder =
+            name === "library"
+                ? "Поиск в моей музыке"
+                : "Трек, исполнитель или ссылка";
+        searchInput.setAttribute(
+            "aria-label",
+            name === "library" ? "Поиск в моей музыке" : "Поиск треков"
+        );
+    }
 
     function stopActiveListRequest() {
         if (activeListAbort) {
@@ -685,6 +708,10 @@
         if (!query) {
             return;
         }
+
+        // Remember the exact query being rendered so tab switches can tell
+        // "results for this query are already on screen" from "not searched".
+        lastOnlineSearchQuery = query;
 
         const requestId = ++searchRequestId;
         if (searchTimer !== null) {
@@ -852,6 +879,7 @@
         // search and invalidate its answer so it cannot overwrite popular.
         stopActiveListRequest();
         searchRequestId += 1;
+        lastOnlineSearchQuery = "";
 
         setSearchHeading("Популярное");
 
@@ -904,8 +932,20 @@
 
     searchInput?.addEventListener("input", () => {
         syncClearButton();
+        // The shared field text always mirrors the local library filter:
+        // switching to "library" then shows the same words as a filter.
+        libraryFilter = searchInput.value;
         if (searchInput.value.trim()) {
             hideSearchHistory();
+        } else {
+            // Empty field means "no online search is outstanding" — a later
+            // tab switch back to "search" must show the trending catalog.
+            lastOnlineSearchQuery = "";
+        }
+        if (activeTab === "library") {
+            // Local filtering only: no /api/search traffic in library tab.
+            applyLibraryFilter();
+            return;
         }
         scheduleSearch();
     });
@@ -918,6 +958,10 @@
         if (searchTimer !== null) {
             window.clearTimeout(searchTimer);
             searchTimer = null;
+        }
+        if (activeTab === "library") {
+            searchInput.blur();
+            return;
         }
         const query = searchInput.value.trim();
         if (query) {
@@ -938,7 +982,16 @@
         }
         searchInput.value = "";
         syncClearButton();
+        // Reset both modes at once: the library shows every track again and
+        // the search tab is guaranteed to fall back to "Популярное".
+        libraryFilter = "";
+        lastOnlineSearchQuery = "";
+        stopActiveListRequest();
+        searchRequestId += 1;
         restorePopular();
+        if (activeTab === "library") {
+            applyLibraryFilter();
+        }
         searchInput.focus();
         haptic();
     });
@@ -1070,7 +1123,7 @@
     }
 
     searchInput?.addEventListener("focus", async () => {
-        if (searchInput.value.trim()) {
+        if (activeTab === "library" || searchInput.value.trim()) {
             return;
         }
         await loadSearchHistory();
@@ -1104,7 +1157,7 @@
 
     searchHistoryChips?.addEventListener("click", (event) => {
         const chip = event.target.closest(".search-history__chip");
-        if (!chip || !searchInput) {
+        if (!chip || !searchInput || activeTab === "library") {
             return;
         }
 
@@ -1147,17 +1200,21 @@
     /* ---------- Now-playing marquee ---------- */
 
     function setupMarquee() {
-        const wrap = document.querySelector(".marquee");
-        const track = wrap?.querySelector(".marquee__track");
-        const text = track?.querySelector(".marquee__text");
-        if (!wrap || !track || !text) {
-            return;
-        }
+        document.querySelectorAll(".marquee").forEach((wrap) => {
+            const track = wrap.querySelector(".marquee__track");
+            const text = track?.querySelector(".marquee__text");
+            if (!track || !text) {
+                return;
+            }
 
-        // The duplicate copy is only shown when the title actually overflows.
-        track.classList.remove("is-scrolling");
-        const overflows = text.getBoundingClientRect().width > wrap.clientWidth;
-        track.classList.toggle("is-scrolling", overflows);
+            // The duplicate copy is only shown when the title actually
+            // overflows: short titles stay put and centered.
+            track.classList.remove("is-scrolling");
+            const overflows =
+                text.getBoundingClientRect().width > wrap.clientWidth;
+            track.classList.toggle("is-scrolling", overflows);
+            wrap.classList.toggle("is-scrolling", overflows);
+        });
     }
 
     window.addEventListener("resize", setupMarquee);
@@ -1282,12 +1339,69 @@
         }
     }
 
+    /* --- Library local filter ---
+       In the "Моя музыка" tab the search field never hits the internet:
+       it filters favorites / playlist tracks / playlist cards by a
+       case-insensitive substring in title or artist. */
+    function libraryFilterQuery() {
+        return libraryFilter.trim().toLowerCase();
+    }
+
+    function matchesLibraryFilter(track) {
+        const query = libraryFilterQuery();
+        if (!query) {
+            return true;
+        }
+        const title = String(track?.title || "").toLowerCase();
+        const artist = String(track?.artist || "").toLowerCase();
+        return title.includes(query) || artist.includes(query);
+    }
+
+    function applyLibraryFilter() {
+        if (activeTab !== "library") {
+            return;
+        }
+
+        if (openPlaylistId) {
+            // Tracks view: filter the cached playlist track list.
+            const tracks = openPlaylistTracks.filter(matchesLibraryFilter);
+            renderPlaylistTracksView(
+                playlistTracksTitle?.textContent || "Плейлист",
+                tracks
+            );
+            return;
+        }
+
+        const activeView =
+            document
+                .querySelector("[data-library-view].is-active")
+                ?.dataset.libraryView || "favorites";
+
+        if (activeView === "playlists") {
+            const query = libraryFilterQuery();
+            const list = query
+                ? playlists.filter((playlist) =>
+                      String(playlist.title || "")
+                          .toLowerCase()
+                          .includes(query)
+                  )
+                : playlists;
+            renderPlaylists(list);
+        } else {
+            renderLibrary();
+        }
+    }
+
     function renderLibrary() {
         if (!libraryList) {
             return;
         }
 
-        const tracks = [...PlayerState.favorites.values()];
+        const query = libraryFilterQuery();
+        const all = [...PlayerState.favorites.values()];
+        const tracks = query
+            ? all.filter(matchesLibraryFilter)
+            : all;
         renderTrackList(libraryList, tracks);
 
         if (libraryCount) {
@@ -1304,6 +1418,9 @@
     let playlistsLoaded = false;
     let playlistsLoading = false;
     let openPlaylistId = null;
+    // Full (unfiltered) track list of the currently open playlist, cached so
+    // the local search field can filter it without re-fetching.
+    let openPlaylistTracks = [];
     let playlistMenuTrack = null;
 
     function pluralizePlaylists(count) {
@@ -1353,7 +1470,11 @@
     document.querySelectorAll("[data-library-view]").forEach((tab) => {
         tab.addEventListener("click", () => {
             openPlaylistId = null;
+            openPlaylistTracks = [];
             activateLibraryView(tab.dataset.libraryView);
+            if (libraryFilter) {
+                applyLibraryFilter();
+            }
             haptic();
         });
     });
@@ -1397,13 +1518,20 @@
         }
     }
 
-    function renderPlaylists() {
+    function renderPlaylists(list = playlists) {
         if (!playlistsList) {
             return;
         }
 
+        const query = libraryFilterQuery();
+        const raw = Array.isArray(list) ? list : [];
+        const source = query
+            ? raw.filter((playlist) =>
+                  String(playlist.title || "").toLowerCase().includes(query)
+              )
+            : raw;
         const fragment = document.createDocumentFragment();
-        playlists.forEach((playlist) => {
+        source.forEach((playlist) => {
             const id = Number(playlist.id);
             const title = String(playlist.title || "Без названия");
 
@@ -1452,7 +1580,7 @@
         playlistsList.replaceChildren(fragment);
         initIcons();
         if (playlistsEmpty) {
-            playlistsEmpty.hidden = playlists.length > 0;
+            playlistsEmpty.hidden = source.length > 0;
         }
         setPlaylistsCount();
     }
@@ -1577,11 +1705,13 @@
         try {
             const tracks = await fetchPlaylistTracks(id);
             if (openPlaylistId === id) {
+                openPlaylistTracks = tracks;
                 renderPlaylistTracksView(playlist.title || "Плейлист", tracks);
             }
         } catch (error) {
             console.error("Playlist tracks load failed:", error);
             if (openPlaylistId === id) {
+                openPlaylistTracks = [];
                 renderPlaylistTracksView(playlist.title || "Плейлист", [], true);
             }
         } finally {
@@ -1637,6 +1767,7 @@
 
     playlistBack?.addEventListener("click", () => {
         openPlaylistId = null;
+        openPlaylistTracks = [];
         activateLibraryView("playlists");
         if (playlistsLoaded) {
             // Refresh the counts after possible adds/removes.
@@ -2295,8 +2426,8 @@
         if (miniArtist) {
             miniArtist.textContent = artist;
         }
-        if (playerSource) {
-            playerSource.textContent = "TG Music";
+        if (playerEyebrow) {
+            playerEyebrow.textContent = "Сейчас играет";
         }
 
         marqueeTexts.forEach((element) => {
@@ -2306,7 +2437,7 @@
         applyCover(miniCover, track.thumbnail);
         applyCover(playerCover, track.thumbnail);
 
-        document.title = `${track.title} — ${artist} · TG Music`;
+        document.title = `${track.title} — ${artist}`;
 
         if (seekBar) {
             seekBar.max = String(track.duration > 0 ? track.duration : 100);
@@ -2360,8 +2491,8 @@
         PlayerState.isPlaying = false;
         renderPlayState();
         setMediaPlaybackState("paused");
-        if (playerSource) {
-            playerSource.textContent = "Не удалось воспроизвести";
+        if (playerEyebrow) {
+            playerEyebrow.textContent = "Не удалось воспроизвести";
         }
     }
 
@@ -2453,19 +2584,6 @@
         return next;
     }
 
-    function stopAtQueueEnd() {
-        audio.pause();
-        try {
-            audio.currentTime = 0;
-        } catch {
-            // Ignore seek errors on unloaded audio.
-        }
-        PlayerState.isPlaying = false;
-        renderPlayState();
-        updateTimeline();
-        setMediaPlaybackState("none");
-    }
-
     function nextTrack({ fromEnded = false } = {}) {
         const length = PlayerState.queue.length;
         if (!length) {
@@ -2490,14 +2608,9 @@
         }
 
         if (next >= length) {
-            if (PlayerState.repeatMode === "all") {
-                next = 0;
-            } else if (fromEnded) {
-                stopAtQueueEnd();
-                return;
-            } else {
-                next = 0;
-            }
+            // The queue loops: after the last track playback continues from
+            // the first one, keeping the music running without interruption.
+            next = 0;
         }
 
         playTrack(next);
@@ -2544,8 +2657,8 @@
         PlayerState.isPlaying = false;
         renderPlayState();
         setMediaPlaybackState("none");
-        if (playerSource) {
-            playerSource.textContent = "Ошибка загрузки трека";
+        if (playerEyebrow) {
+            playerEyebrow.textContent = "Ошибка загрузки трека";
         }
     }
 
@@ -2728,8 +2841,8 @@
         try {
             navigator.mediaSession.metadata = new MediaMetadata({
                 title: track.title,
-                artist: track.artist || "TG Music",
-                album: "TG Music",
+                artist: track.artist || "Неизвестный исполнитель",
+                album: track.artist || "Музыка",
                 artwork,
             });
         } catch (error) {
@@ -2898,6 +3011,9 @@
         fullPlayer.classList.add("is-open");
         fullPlayer.setAttribute("aria-hidden", "false");
         fullPlayer.inert = false;
+        // The title becomes measurable only while the player is visible:
+        // decide the marquee state now (a resize ticker refines it below).
+        setupMarquee();
         haptic();
     }
 
@@ -3159,7 +3275,6 @@
     initIcons();
     setupMarquee();
     setupMediaSession();
-    checkApi();
 
     // Restore the previous session's queue/position/modes *before* the
     // catalog loads, always paused (WebView forbids autoplay anyway).
