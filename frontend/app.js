@@ -7,6 +7,9 @@
         Number(window.Telegram?.WebApp?.initDataUnsafe?.user?.id) ||
         FALLBACK_USER_ID;
     const VOLUME_STORAGE_KEY = "tg-music-volume";
+    const PLAYER_STATE_STORAGE_KEY = "tg-music-player-state";
+    const PLAYER_STATE_PERSIST_MS = 5000;
+    const PLAYER_STATE_MAX_QUEUE = 200;
     const SEARCH_LIMIT = 15;
     const SEARCH_DEBOUNCE_MS = 450;
     const TRENDING_LIMIT = 20;
@@ -50,7 +53,28 @@
     const libraryList = document.getElementById("library-list");
     const libraryCount = document.getElementById("library-count");
     const libraryEmpty = document.getElementById("library-empty");
-    const libraryHint = document.getElementById("library-hint");
+    const libraryViewFavorites = document.getElementById("library-view-favorites");
+    const libraryViewPlaylists = document.getElementById("library-view-playlists");
+    const libraryViewTracks = document.getElementById("library-view-playlist-tracks");
+    const playlistsCount = document.getElementById("playlists-count");
+    const createPlaylistButton = document.getElementById("create-playlist");
+    const playlistsList = document.getElementById("playlists-list");
+    const playlistsEmpty = document.getElementById("playlists-empty");
+    const playlistBack = document.getElementById("playlist-back");
+    const playlistPlay = document.getElementById("playlist-play");
+    const playlistTracksTitle = document.getElementById("playlist-tracks-title");
+    const playlistTracksList = document.getElementById("playlist-tracks-list");
+    const playlistTracksEmpty = document.getElementById("playlist-tracks-empty");
+
+    const playlistMenu = document.getElementById("playlist-menu");
+    const playlistMenuList = document.getElementById("playlist-menu-list");
+    const playlistMenuClose = document.getElementById("playlist-menu-close");
+    const playlistMenuNew = document.getElementById("playlist-menu-new");
+    const fullAddPlaylist = document.getElementById("full-add-playlist");
+
+    const searchHistoryBlock = document.getElementById("search-history");
+    const searchHistoryChips = document.getElementById("search-history-chips");
+    const searchHistoryClear = document.getElementById("search-history-clear");
 
     const fullPlayer = document.getElementById("full-player");
     const expandPlayer = document.getElementById("expand-player");
@@ -110,6 +134,19 @@
     // Timestamp of the last user-driven volume change: the async
     // CloudStorage restore must not overwrite a newer local decision.
     let lastUserVolumeChange = 0;
+    // Timestamp of the last user-driven playback action (play/pause/next/
+    // shuffle…): the async CloudStorage player-state restore uses it the
+    // same way, so a late callback cannot clobber a live session.
+    let lastUserPlaybackAction = 0;
+    // Saved position to feed into the track as soon as its metadata arrives.
+    let pendingSeekSeconds = 0;
+    // Track (restored from a previous session) the queue should resume into.
+    let pendingResume = null;
+    // savedAt of the last applied persisted snapshot — used to decide
+    // whether a late CloudStorage copy is fresher than the local one.
+    let restoredStateSavedAt = 0;
+    // Throttle for timeupdate-driven persistence.
+    let lastPlayerPersistAt = 0;
 
     PlayerState.volume = readStoredVolume();
     lastAudibleVolume = PlayerState.volume > 0 ? PlayerState.volume : 1;
@@ -255,6 +292,176 @@
         }
     }
 
+    /* ---------- Player state persistence ---------- */
+
+    function markUserPlaybackAction() {
+        lastUserPlaybackAction = Date.now();
+    }
+
+    function capturePlayerState(position) {
+        const current = PlayerState.queue[PlayerState.currentIndex] || null;
+        const index = clamp(
+            PlayerState.currentIndex,
+            -1,
+            PlayerState.queue.length - 1
+        );
+
+        return {
+            version: 1,
+            queue: PlayerState.queue.slice(0, PLAYER_STATE_MAX_QUEUE),
+            currentIndex: index,
+            trackId: current?.track_id || "",
+            isShuffle: PlayerState.isShuffle,
+            repeatMode: PlayerState.repeatMode,
+            position: Math.max(0, Number(position) || 0),
+            savedAt: Date.now(),
+        };
+    }
+
+    function savePlayerState({ force = false, position = null } = {}) {
+        if (!PlayerState.queue.length) {
+            return;
+        }
+
+        const now = Date.now();
+        if (!force && now - lastPlayerPersistAt < PLAYER_STATE_PERSIST_MS) {
+            return;
+        }
+        lastPlayerPersistAt = now;
+
+        const value = position === null ? audio.currentTime : position;
+        const payload = JSON.stringify(capturePlayerState(value));
+
+        try {
+            window.localStorage.setItem(PLAYER_STATE_STORAGE_KEY, payload);
+        } catch {
+            // localStorage can be disabled in private/embedded contexts.
+        }
+
+        // CloudStorage survives tunnel/domain changes — the durable mirror.
+        try {
+            tg?.CloudStorage?.setItem?.(
+                PLAYER_STATE_STORAGE_KEY,
+                payload
+            );
+        } catch {
+            // CloudStorage may be unavailable outside Telegram.
+        }
+    }
+
+    function readPlayerStateFromStorage(storage) {
+        try {
+            const raw = storage?.getItem?.(PLAYER_STATE_STORAGE_KEY);
+            if (!raw) {
+                return null;
+            }
+            const data = JSON.parse(raw);
+            if (!data || !Array.isArray(data.queue)) {
+                return null;
+            }
+            return data;
+        } catch {
+            return null;
+        }
+    }
+
+    function applyRestoredState(data, savedAt) {
+        const queue = (Array.isArray(data.queue) ? data.queue : [])
+            .map(normalizeTrack)
+            .filter((track) => track.track_id);
+        if (!queue.length) {
+            return;
+        }
+
+        const rawIndex = Number(data.currentIndex);
+        let index =
+            Number.isInteger(rawIndex) && rawIndex >= 0 && rawIndex < queue.length
+                ? rawIndex
+                : queue.findIndex(
+                      (track) => track.track_id === data.trackId
+                  );
+
+        PlayerState.queue = queue;
+        PlayerState.currentIndex = index;
+        PlayerState.isShuffle = Boolean(data.isShuffle);
+        PlayerState.repeatMode = repeatStates.includes(data.repeatMode)
+            ? data.repeatMode
+            : "none";
+
+        shuffleButton?.setAttribute(
+            "aria-pressed",
+            String(PlayerState.isShuffle)
+        );
+        if (repeatButton) {
+            repeatButton.dataset.state = PlayerState.repeatMode;
+            repeatButton.setAttribute(
+                "aria-pressed",
+                String(PlayerState.repeatMode !== "none")
+            );
+            repeatButton.setAttribute(
+                "aria-label",
+                repeatLabels[PlayerState.repeatMode]
+            );
+        }
+
+        const current = PlayerState.queue[PlayerState.currentIndex];
+        if (current) {
+            // Quiet restore: queue and position are applied on pause; the
+            // position resumes only when the user starts this exact track.
+            const position = Math.max(0, Number(data.position) || 0);
+            pendingResume = { trackId: current.track_id, position };
+            showPlayerDock();
+            updateTrackUI(current);
+            pendingSeekSeconds = 0;
+            if (currentTime && position > 0) {
+                currentTime.textContent = formatTime(position);
+            }
+        }
+
+        restoredStateSavedAt = Math.max(0, Number(savedAt) || 0);
+        markCurrentCard();
+        renderPlayState();
+    }
+
+    function restoreSavedPlayerState() {
+        const local = readPlayerStateFromStorage(window.localStorage);
+        if (local) {
+            applyRestoredState(local, Number(local.savedAt) || 0);
+        }
+
+        // Telegram CloudStorage may hold a fresher snapshot saved under a
+        // previous tunnel/domain. The callback fires asynchronously, so it
+        // yields to any user action started in the meantime.
+        try {
+            if (typeof tg?.CloudStorage?.getItem !== "function") {
+                return;
+            }
+            const startedAt = Date.now();
+            tg.CloudStorage.getItem(PLAYER_STATE_STORAGE_KEY, (err, val) => {
+                if (err || !val) {
+                    return;
+                }
+                const data = readPlayerStateFromStorage({
+                    getItem: () => val,
+                });
+                const cloudSavedAt = Number(data?.savedAt) || 0;
+                if (
+                    !data ||
+                    cloudSavedAt <= restoredStateSavedAt ||
+                    // The user already started interacting: the live session
+                    // wins, otherwise this late callback would silently
+                    // replace the queue (same race as the volume slider).
+                    lastUserPlaybackAction > startedAt
+                ) {
+                    return;
+                }
+                applyRestoredState(data, cloudSavedAt);
+            });
+        } catch {
+            // CloudStorage may be unavailable outside Telegram.
+        }
+    }
+
     /* ---------- API status ---------- */
 
     function setBadge(state, text) {
@@ -326,6 +533,19 @@
     /* ---------- Tabs ---------- */
 
     function activateTab(name) {
+        // Cancels a pending delayed hide and closes the live block: switching
+        // tabs must never leave a stale timer collapsing the panel later.
+        if (searchHistoryHideTimer !== null) {
+            window.clearTimeout(searchHistoryHideTimer);
+            searchHistoryHideTimer = null;
+        }
+        if (searchHistoryShown) {
+            hideSearchHistory();
+        }
+        // Drop focus so the keyboard/focus ring does not linger after a tab
+        // switch (and so no delayed blur does it for us at a bad moment).
+        searchInput?.blur();
+
         tabs.forEach((tab) => {
             const active = tab.dataset.tab === name;
             tab.classList.toggle("is-active", active);
@@ -342,6 +562,10 @@
             // Show the cached list instantly, then refresh it from SQLite.
             renderLibrary();
             loadFavorites({ force: true });
+            if (playlistsLoaded) {
+                // Counts may have changed since the last visit.
+                void loadPlaylists({ quiet: true });
+            }
         }
     }
 
@@ -365,6 +589,23 @@
     let searchRequestId = 0;
     let popularTracks = [];
     let popularLoaded = false;
+    // AbortController of the catalog request in flight (/api/search or
+    // /api/trending). A new request cancels the previous one so fast typing
+    // does not leave several yt-dlp lookups running on the backend.
+    let activeListAbort = null;
+
+    function stopActiveListRequest() {
+        if (activeListAbort) {
+            activeListAbort.abort();
+            activeListAbort = null;
+        }
+    }
+
+    function forgetActiveListRequest(controller) {
+        if (activeListAbort === controller) {
+            activeListAbort = null;
+        }
+    }
 
     function syncClearButton() {
         if (!searchInput || !clearSearch) {
@@ -450,6 +691,9 @@
             window.clearTimeout(searchTimer);
             searchTimer = null;
         }
+        stopActiveListRequest();
+        const controller = new AbortController();
+        activeListAbort = controller;
 
         setSearchHeading("Результаты поиска");
         setSearchCount("Поиск…");
@@ -458,10 +702,12 @@
 
         try {
             const response = await fetch(
-                `/api/search?q=${encodeURIComponent(query)}&limit=${SEARCH_LIMIT}`,
+                `/api/search?q=${encodeURIComponent(query)}&limit=${SEARCH_LIMIT}` +
+                    `&user_id=${encodeURIComponent(String(PlayerState.userId))}`,
                 {
                     cache: "no-store",
-                    headers: { Accept: "application/json" },
+                    headers: apiHeaders(),
+                    signal: controller.signal,
                 }
             );
 
@@ -479,11 +725,19 @@
                 .filter((track) => track.track_id);
 
             renderTracks(tracks);
-            syncQueueFromCards({ preserveCurrent: Boolean(audio.src) });
+            // A restored queue must survive the first trending render too:
+            // `pendingResume` marks the restored current track even though
+            // nothing is loaded into the audio element yet.
+            syncQueueFromCards({
+                preserveCurrent: Boolean(audio.src || pendingResume),
+            });
             setSearchCount(pluralizeTracks(tracks.length));
 
             if (tracks.length) {
                 hideSearchEmpty();
+                // The backend stores the query too; this keeps the chip row
+                // in sync without an extra request.
+                rememberSearchQuery(query);
             } else {
                 showSearchEmpty(
                     "Ничего не найдено",
@@ -492,7 +746,8 @@
                 );
             }
         } catch (error) {
-            if (requestId !== searchRequestId) {
+            if (requestId !== searchRequestId || error?.name === "AbortError") {
+                // Aborted means a newer query superseded this one.
                 return;
             }
             console.error("Search failed:", error);
@@ -505,6 +760,7 @@
                 );
             }
         } finally {
+            forgetActiveListRequest(controller);
             if (requestId === searchRequestId) {
                 trackList?.setAttribute("aria-busy", "false");
             }
@@ -517,6 +773,9 @@
             window.clearTimeout(searchTimer);
             searchTimer = null;
         }
+        stopActiveListRequest();
+        const controller = new AbortController();
+        activeListAbort = controller;
 
         setSearchHeading("Популярное");
         setSearchCount("Загрузка…");
@@ -528,6 +787,7 @@
                 {
                     cache: "no-store",
                     headers: { Accept: "application/json" },
+                    signal: controller.signal,
                 }
             );
 
@@ -547,7 +807,9 @@
             popularTracks = tracks;
             popularLoaded = true;
             renderTracks(tracks);
-            syncQueueFromCards({ preserveCurrent: Boolean(audio.src) });
+            syncQueueFromCards({
+                preserveCurrent: Boolean(audio.src || pendingResume),
+            });
             setSearchCount(pluralizeTracks(tracks.length));
 
             if (tracks.length) {
@@ -559,7 +821,8 @@
                 );
             }
         } catch (error) {
-            if (requestId !== searchRequestId) {
+            if (requestId !== searchRequestId || error?.name === "AbortError") {
+                // Aborted means a newer tab/search request replaced this one.
                 return;
             }
             console.error("Trending failed:", error);
@@ -573,6 +836,7 @@
                 );
             }
         } finally {
+            forgetActiveListRequest(controller);
             if (requestId === searchRequestId) {
                 trackList?.setAttribute("aria-busy", "false");
             }
@@ -584,6 +848,11 @@
             window.clearTimeout(searchTimer);
             searchTimer = null;
         }
+        // Clearing the field is also "a newer request": kill the in-flight
+        // search and invalidate its answer so it cannot overwrite popular.
+        stopActiveListRequest();
+        searchRequestId += 1;
+
         setSearchHeading("Популярное");
 
         if (!popularLoaded) {
@@ -592,7 +861,9 @@
         }
 
         renderTracks(popularTracks);
-        syncQueueFromCards({ preserveCurrent: Boolean(audio.src) });
+        syncQueueFromCards({
+            preserveCurrent: Boolean(audio.src || pendingResume),
+        });
         setSearchCount(pluralizeTracks(popularTracks.length));
         trackList?.setAttribute("aria-busy", "false");
 
@@ -633,6 +904,9 @@
 
     searchInput?.addEventListener("input", () => {
         syncClearButton();
+        if (searchInput.value.trim()) {
+            hideSearchHistory();
+        }
         scheduleSearch();
     });
 
@@ -670,6 +944,205 @@
     });
 
     syncClearButton();
+
+    /* ---------- Search history chips ---------- */
+
+    let searchHistoryItems = [];
+    let searchHistoryLoaded = false;
+    let searchHistoryShown = false;
+    let searchHistoryHideTimer = null;
+
+    async function loadSearchHistory({ clearLoaded = false } = {}) {
+        if (searchHistoryLoaded && !clearLoaded) {
+            return searchHistoryItems;
+        }
+
+        try {
+            const response = await fetch(
+                authenticatedUrl("/api/search-history?limit=10"),
+                {
+                    cache: "no-store",
+                    headers: apiHeaders(),
+                }
+            );
+            if (!response.ok) {
+                throw new Error(`Search history HTTP ${response.status}`);
+            }
+
+            const payload = await response.json();
+            searchHistoryItems = (Array.isArray(payload) ? payload : [])
+                .map((item) => String(item?.query ?? "").trim())
+                .filter(Boolean)
+                .slice(0, 10);
+            searchHistoryLoaded = true;
+        } catch (error) {
+            console.error("Search history load failed:", error);
+        }
+        return searchHistoryItems;
+    }
+
+    function rememberSearchQuery(query) {
+        const cleaned = String(query ?? "").trim();
+        if (!cleaned) {
+            return;
+        }
+        // Successive identical queries are also deduplicated on the backend.
+        if (searchHistoryItems[0] === cleaned) {
+            return;
+        }
+        searchHistoryItems = [
+            cleaned,
+            ...searchHistoryItems.filter((item) => item !== cleaned),
+        ].slice(0, 10);
+        searchHistoryLoaded = true;
+    }
+
+    function renderSearchHistoryChips() {
+        if (!searchHistoryChips) {
+            return;
+        }
+
+        const fragment = document.createDocumentFragment();
+        searchHistoryItems.forEach((query) => {
+            const chip = document.createElement("button");
+            chip.className = "search-history__chip";
+            chip.type = "button";
+            chip.dataset.query = query;
+
+            const glyph = document.createElement("i");
+            glyph.dataset.lucide = "history";
+
+            const label = document.createElement("span");
+            label.textContent = query;
+
+            chip.append(glyph, label);
+            fragment.append(chip);
+        });
+
+        searchHistoryChips.replaceChildren(fragment);
+        initIcons();
+    }
+
+    function updateSearchHistoryVisibility() {
+        if (!searchHistoryBlock) {
+            return;
+        }
+        const canShow =
+            searchHistoryShown &&
+            searchHistoryItems.length > 0 &&
+            searchInput instanceof HTMLInputElement &&
+            searchInput.value.trim() === "";
+        searchHistoryBlock.hidden = !canShow;
+    }
+
+    function showSearchHistory() {
+        searchHistoryShown = true;
+        if (searchHistoryHideTimer !== null) {
+            window.clearTimeout(searchHistoryHideTimer);
+            searchHistoryHideTimer = null;
+        }
+        updateSearchHistoryVisibility();
+    }
+
+    function hideSearchHistory() {
+        searchHistoryShown = false;
+        if (searchHistoryHideTimer !== null) {
+            window.clearTimeout(searchHistoryHideTimer);
+            searchHistoryHideTimer = null;
+        }
+        if (searchHistoryBlock) {
+            searchHistoryBlock.hidden = true;
+        }
+    }
+
+    // Delayed close: a `pointerdown` elsewhere (tabs, track cards) must not
+    // collapse the history block synchronously — the layout would jump before
+    // the `click` lands and the tap would miss its target. Scheduling the
+    // hide lets the pending click fire at the old coordinates first.
+    function scheduleHideSearchHistory(delay = 180) {
+        if (searchHistoryHideTimer !== null) {
+            window.clearTimeout(searchHistoryHideTimer);
+        }
+        searchHistoryHideTimer = window.setTimeout(() => {
+            searchHistoryHideTimer = null;
+            hideSearchHistory();
+        }, delay);
+    }
+
+    searchInput?.addEventListener("focus", async () => {
+        if (searchInput.value.trim()) {
+            return;
+        }
+        await loadSearchHistory();
+        renderSearchHistoryChips();
+        showSearchHistory();
+    });
+
+    searchInput?.addEventListener("blur", () => {
+        // A small delay lets a click on a chip land first.
+        scheduleHideSearchHistory(180);
+    });
+
+    searchHistoryBlock?.addEventListener("pointerdown", () => {
+        if (searchHistoryHideTimer !== null) {
+            window.clearTimeout(searchHistoryHideTimer);
+            searchHistoryHideTimer = null;
+        }
+    });
+
+    document.addEventListener("pointerdown", (event) => {
+        if (!searchHistoryShown) {
+            return;
+        }
+        if (event.target.closest("#search-history, .search-field")) {
+            return;
+        }
+        // Also scheduled (not synchronous): tapping a tab or a track card
+        // first fires `click` there, then the block collapses.
+        scheduleHideSearchHistory(180);
+    });
+
+    searchHistoryChips?.addEventListener("click", (event) => {
+        const chip = event.target.closest(".search-history__chip");
+        if (!chip || !searchInput) {
+            return;
+        }
+
+        const query = chip.dataset.query || "";
+        if (!query) {
+            return;
+        }
+
+        searchInput.value = query;
+        syncClearButton();
+        hideSearchHistory();
+        performSearch(query);
+        haptic();
+    });
+
+    searchHistoryClear?.addEventListener("click", async () => {
+        try {
+            const response = await fetch(
+                authenticatedUrl("/api/search-history"),
+                {
+                    method: "DELETE",
+                    cache: "no-store",
+                    headers: apiHeaders(),
+                }
+            );
+            if (!response.ok) {
+                throw new Error(
+                    `Search history clear HTTP ${response.status}`
+                );
+            }
+            searchHistoryItems = [];
+            searchHistoryLoaded = true;
+            hideSearchHistory();
+            haptic();
+        } catch (error) {
+            console.error("Clearing search history failed:", error);
+        }
+    });
 
     /* ---------- Now-playing marquee ---------- */
 
@@ -735,6 +1208,8 @@
     let favoritesLoaded = false;
     let favoritesRequestId = 0;
     let favoritesRevision = 0;
+    let favoritesCatchUpPending = false;
+    let favoritesAbort = null;
     const pendingLikeRequests = new Set();
 
     function isFavorite(trackId) {
@@ -773,6 +1248,10 @@
             liked ? "Убрать из избранного" : "Добавить в избранное"
         );
         fullLike.disabled = !track?.track_id;
+
+        if (fullAddPlaylist) {
+            fullAddPlaylist.disabled = !track?.track_id;
+        }
     }
 
     function syncLikeUI() {
@@ -817,12 +1296,557 @@
         if (libraryEmpty) {
             libraryEmpty.hidden = tracks.length > 0;
         }
-        if (libraryHint) {
-            libraryHint.hidden = false;
+    }
+
+    /* ---------- Playlists ---------- */
+
+    let playlists = [];
+    let playlistsLoaded = false;
+    let playlistsLoading = false;
+    let openPlaylistId = null;
+    let playlistMenuTrack = null;
+
+    function pluralizePlaylists(count) {
+        const mod10 = count % 10;
+        const mod100 = count % 100;
+        if (mod10 === 1 && mod100 !== 11) {
+            return `${count} плейлист`;
+        }
+        if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) {
+            return `${count} плейлиста`;
+        }
+        return `${count} плейлистов`;
+    }
+
+    function setPlaylistsCount() {
+        if (playlistsCount) {
+            playlistsCount.textContent = pluralizePlaylists(playlists.length);
         }
     }
 
-    async function loadFavorites({ force = false } = {}) {
+    function authenticatedUrl(path) {
+        return `${path}?user_id=${encodeURIComponent(String(PlayerState.userId))}`;
+    }
+
+    function activateLibraryView(name) {
+        document.querySelectorAll("[data-library-view]").forEach((tab) => {
+            const active = tab.dataset.libraryView === name;
+            tab.classList.toggle("is-active", active);
+            tab.setAttribute("aria-selected", String(active));
+        });
+
+        if (libraryViewFavorites) {
+            libraryViewFavorites.hidden = name !== "favorites";
+        }
+        if (libraryViewPlaylists) {
+            libraryViewPlaylists.hidden = name !== "playlists";
+        }
+        if (libraryViewTracks) {
+            libraryViewTracks.hidden = name !== "tracks";
+        }
+
+        if (name === "playlists") {
+            loadPlaylists();
+        }
+    }
+
+    document.querySelectorAll("[data-library-view]").forEach((tab) => {
+        tab.addEventListener("click", () => {
+            openPlaylistId = null;
+            activateLibraryView(tab.dataset.libraryView);
+            haptic();
+        });
+    });
+
+    async function loadPlaylists({ quiet = false } = {}) {
+        if (playlistsLoading) {
+            return;
+        }
+
+        playlistsLoading = true;
+        if (!quiet && playlistsList) {
+            playlistsList.setAttribute("aria-busy", "true");
+        }
+
+        try {
+            const response = await fetch(authenticatedUrl("/api/playlists"), {
+                cache: "no-store",
+                headers: apiHeaders(),
+            });
+
+            if (!response.ok) {
+                throw new Error(`Playlists HTTP ${response.status}`);
+            }
+
+            const payload = await response.json();
+            playlists = (Array.isArray(payload) ? payload : []).filter(
+                (playlist) => Number.isFinite(Number(playlist?.id))
+            );
+            playlistsLoaded = true;
+            renderPlaylists();
+        } catch (error) {
+            console.error("Playlists load failed:", error);
+            if (!quiet) {
+                renderPlaylists();
+            }
+        } finally {
+            playlistsLoading = false;
+            if (playlistsList) {
+                playlistsList.setAttribute("aria-busy", "false");
+            }
+        }
+    }
+
+    function renderPlaylists() {
+        if (!playlistsList) {
+            return;
+        }
+
+        const fragment = document.createDocumentFragment();
+        playlists.forEach((playlist) => {
+            const id = Number(playlist.id);
+            const title = String(playlist.title || "Без названия");
+
+            const card = document.createElement("article");
+            card.className = "playlist-card";
+            card.tabIndex = 0;
+            card.dataset.playlistId = String(id);
+
+            const icon = document.createElement("span");
+            icon.className = "playlist-card__icon";
+            icon.setAttribute("aria-hidden", "true");
+            const iconGlyph = document.createElement("i");
+            iconGlyph.dataset.lucide = "list-music";
+            icon.append(iconGlyph);
+
+            const body = document.createElement("div");
+            body.className = "playlist-card__body";
+            const titleElement = document.createElement("h3");
+            titleElement.className = "playlist-card__title";
+            titleElement.textContent = title;
+            const meta = document.createElement("p");
+            meta.className = "playlist-card__meta";
+            meta.textContent = pluralizeTracks(Number(playlist.track_count) || 0);
+            body.append(titleElement, meta);
+
+            const play = document.createElement("button");
+            play.className = "playlist-card__play";
+            play.type = "button";
+            play.setAttribute("aria-label", `Воспроизвести «${title}»`);
+            const playGlyph = document.createElement("i");
+            playGlyph.dataset.lucide = "play";
+            play.append(playGlyph);
+
+            const remove = document.createElement("button");
+            remove.className = "playlist-card__delete";
+            remove.type = "button";
+            remove.setAttribute("aria-label", `Удалить «${title}»`);
+            const removeGlyph = document.createElement("i");
+            removeGlyph.dataset.lucide = "trash-2";
+            remove.append(removeGlyph);
+
+            card.append(icon, body, play, remove);
+            fragment.append(card);
+        });
+
+        playlistsList.replaceChildren(fragment);
+        initIcons();
+        if (playlistsEmpty) {
+            playlistsEmpty.hidden = playlists.length > 0;
+        }
+        setPlaylistsCount();
+    }
+
+    async function createPlaylistRequest(title) {
+        const response = await fetch("/api/playlists", {
+            method: "POST",
+            cache: "no-store",
+            headers: apiHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({
+                user_id: PlayerState.userId,
+                title,
+            }),
+        });
+
+        if (!response.ok) {
+            throw new Error(`Playlist create HTTP ${response.status}`);
+        }
+
+        const playlist = await response.json();
+        playlists = [playlist, ...playlists];
+        playlistsLoaded = true;
+        renderPlaylists();
+        return playlist;
+    }
+
+    function askPlaylistTitle() {
+        let value = null;
+        try {
+            value = window.prompt("Название плейлиста:", "Новый плейлист");
+        } catch {
+            // prompt() can be unavailable in some WebView contexts.
+        }
+        if (value === null) {
+            return "";
+        }
+        return String(value).trim() || "Новый плейлист";
+    }
+
+    async function createPlaylist() {
+        const title = askPlaylistTitle();
+        if (!title) {
+            return;
+        }
+
+        try {
+            await createPlaylistRequest(title);
+            haptic("medium");
+        } catch (error) {
+            console.error("Playlist creation failed:", error);
+        }
+    }
+
+    async function deletePlaylist(playlist) {
+        const id = Number(playlist?.id);
+        if (!Number.isFinite(id)) {
+            return;
+        }
+
+        try {
+            const response = await fetch(
+                authenticatedUrl(`/api/playlists/${id}`),
+                { method: "DELETE", headers: apiHeaders() }
+            );
+
+            if (!response.ok) {
+                throw new Error(`Playlist delete HTTP ${response.status}`);
+            }
+
+            playlists = playlists.filter((item) => Number(item.id) !== id);
+            renderPlaylists();
+            haptic();
+        } catch (error) {
+            console.error("Playlist deletion failed:", error);
+        }
+    }
+
+    function renderPlaylistTracksView(title, tracks, isError = false) {
+        if (playlistTracksTitle) {
+            playlistTracksTitle.textContent = title;
+        }
+        renderTrackList(playlistTracksList, tracks);
+        if (playlistTracksEmpty) {
+            playlistTracksEmpty.hidden = !isError && tracks.length > 0;
+        }
+    }
+
+    async function fetchPlaylistTracks(playlistId) {
+        const response = await fetch(
+            authenticatedUrl(`/api/playlists/${Number(playlistId)}/tracks`),
+            { cache: "no-store", headers: apiHeaders() }
+        );
+
+        if (!response.ok) {
+            throw new Error(`Playlist tracks HTTP ${response.status}`);
+        }
+
+        const payload = await response.json();
+        return (Array.isArray(payload) ? payload : [])
+            .map(normalizeTrack)
+            .filter((track) => track.track_id);
+    }
+
+    async function openPlaylist(playlist) {
+        const id = Number(playlist?.id);
+        if (!Number.isFinite(id)) {
+            return;
+        }
+
+        openPlaylistId = id;
+        activateLibraryView("tracks");
+        if (playlistTracksTitle) {
+            playlistTracksTitle.textContent = playlist.title || "Плейлист";
+        }
+        if (playlistTracksList) {
+            playlistTracksList.setAttribute("aria-busy", "true");
+        }
+        if (playlistTracksEmpty) {
+            playlistTracksEmpty.hidden = true;
+        }
+
+        try {
+            const tracks = await fetchPlaylistTracks(id);
+            if (openPlaylistId === id) {
+                renderPlaylistTracksView(playlist.title || "Плейлист", tracks);
+            }
+        } catch (error) {
+            console.error("Playlist tracks load failed:", error);
+            if (openPlaylistId === id) {
+                renderPlaylistTracksView(playlist.title || "Плейлист", [], true);
+            }
+        } finally {
+            if (playlistTracksList) {
+                playlistTracksList.setAttribute("aria-busy", "false");
+            }
+        }
+    }
+
+    async function playPlaylist(playlist) {
+        const id = Number(playlist?.id);
+        if (!Number.isFinite(id)) {
+            return;
+        }
+
+        haptic("medium");
+        try {
+            const tracks = await fetchPlaylistTracks(id);
+            if (!tracks.length) {
+                return;
+            }
+            markUserPlaybackAction();
+            setQueue(tracks, 0);
+        } catch (error) {
+            console.error("Playlist playback failed:", error);
+        }
+    }
+
+    playlistsList?.addEventListener("click", (event) => {
+        const card = event.target.closest(".playlist-card");
+        if (!card) {
+            return;
+        }
+        const playlist = playlists.find(
+            (item) => Number(item.id) === Number(card.dataset.playlistId)
+        );
+        if (!playlist) {
+            return;
+        }
+
+        if (event.target.closest(".playlist-card__play")) {
+            void playPlaylist(playlist);
+            return;
+        }
+        if (event.target.closest(".playlist-card__delete")) {
+            void deletePlaylist(playlist);
+            return;
+        }
+        void openPlaylist(playlist);
+    });
+
+    createPlaylistButton?.addEventListener("click", () => void createPlaylist());
+
+    playlistBack?.addEventListener("click", () => {
+        openPlaylistId = null;
+        activateLibraryView("playlists");
+        if (playlistsLoaded) {
+            // Refresh the counts after possible adds/removes.
+            void loadPlaylists({ quiet: true });
+        }
+        haptic();
+    });
+
+    playlistPlay?.addEventListener("click", () => {
+        const playlist = playlists.find(
+            (item) => Number(item.id) === openPlaylistId
+        );
+        if (playlist) {
+            void playPlaylist(playlist);
+            return;
+        }
+        // The playlist list may have been refreshed while tracks view was
+        // open: fall back to playing the rendered track list.
+        const rendered = [...(playlistTracksList?.children || [])]
+            .map((card) => getTrackFromCard(card))
+            .filter((track) => track.track_id);
+        if (rendered.length) {
+            markUserPlaybackAction();
+            setQueue(rendered, 0);
+        }
+    });
+
+    /* ---------- "Add to playlist" picker ---------- */
+
+    function addTrackToPlaylistRequest(playlistId, track) {
+        return fetch(
+            authenticatedUrl(`/api/playlists/${Number(playlistId)}/tracks`),
+            {
+                method: "POST",
+                cache: "no-store",
+                headers: apiHeaders({ "Content-Type": "application/json" }),
+                body: JSON.stringify({ user_id: PlayerState.userId, ...track }),
+            }
+        );
+    }
+
+    function updatePlaylistCount(playlistId, delta) {
+        const id = Number(playlistId);
+        playlists = playlists.map((playlist) =>
+            Number(playlist.id) === id
+                ? {
+                      ...playlist,
+                      track_count: Math.max(
+                          0,
+                          (Number(playlist.track_count) || 0) + delta
+                      ),
+                  }
+                : playlist
+        );
+        setPlaylistsCount();
+    }
+
+    function renderPlaylistMenu() {
+        if (!playlistMenuList) {
+            return;
+        }
+
+        const fragment = document.createDocumentFragment();
+
+        if (!playlistsLoaded) {
+            const loading = document.createElement("p");
+            loading.className = "playlist-menu__empty";
+            loading.textContent = "Загрузка плейлистов…";
+            fragment.append(loading);
+        } else {
+            playlists.forEach((playlist) => {
+                const item = document.createElement("button");
+                item.className = "playlist-menu__item";
+                item.type = "button";
+                item.dataset.playlistId = String(Number(playlist.id));
+
+                const glyph = document.createElement("i");
+                glyph.dataset.lucide = "list-music";
+
+                const title = document.createElement("span");
+                title.className = "playlist-menu__item-title";
+                title.textContent = String(playlist.title || "Без названия");
+
+                const state = document.createElement("span");
+                state.className = "playlist-menu__item-state";
+
+                item.append(glyph, title, state);
+                fragment.append(item);
+            });
+
+            if (!playlists.length) {
+                const empty = document.createElement("p");
+                empty.className = "playlist-menu__empty";
+                empty.textContent =
+                    "Плейлистов пока нет — создайте первый ниже.";
+                fragment.append(empty);
+            }
+        }
+
+        playlistMenuList.replaceChildren(fragment);
+        initIcons();
+    }
+
+    function openPlaylistMenu(track) {
+        const normalized = normalizeTrack(track);
+        if (!normalized.track_id || !playlistMenu) {
+            return;
+        }
+
+        playlistMenuTrack = normalized;
+        renderPlaylistMenu();
+        playlistMenu.hidden = false;
+        haptic();
+
+        // Re-render with the fresh list when it arrives.
+        if (!playlistsLoaded) {
+            void loadPlaylists({ quiet: true }).then(renderPlaylistMenu);
+        }
+    }
+
+    function closePlaylistMenu() {
+        if (!playlistMenu) {
+            return;
+        }
+        playlistMenu.hidden = true;
+        playlistMenuTrack = null;
+    }
+
+    playlistMenu?.addEventListener("click", async (event) => {
+        if (event.target.closest("[data-close-playlist-menu]")) {
+            closePlaylistMenu();
+            return;
+        }
+
+        const item = event.target.closest(".playlist-menu__item");
+        if (!item || !playlistMenuTrack || item.classList.contains("is-busy")) {
+            return;
+        }
+
+        const playlistId = Number(item.dataset.playlistId);
+        if (!Number.isFinite(playlistId)) {
+            return;
+        }
+
+        const stateElement = item.querySelector(".playlist-menu__item-state");
+        haptic();
+        try {
+            item.classList.add("is-busy");
+            const response = await addTrackToPlaylistRequest(
+                playlistId,
+                playlistMenuTrack
+            );
+            if (!response.ok) {
+                throw new Error(`Playlist add HTTP ${response.status}`);
+            }
+
+            const payload = await response.json();
+            if (payload?.added) {
+                updatePlaylistCount(playlistId, 1);
+            }
+            if (stateElement) {
+                stateElement.textContent = payload?.added
+                    ? "Добавлено ✓"
+                    : "Уже в плейлисте";
+            }
+            item.classList.remove("is-busy");
+            window.setTimeout(() => {
+                if (playlistMenu && !playlistMenu.hidden) {
+                    closePlaylistMenu();
+                }
+                // The open tracks view may include this playlist.
+                if (openPlaylistId === playlistId) {
+                    void openPlaylist({ id: playlistId, title: playlistTracksTitle?.textContent });
+                }
+            }, 700);
+        } catch (error) {
+            item.classList.remove("is-busy");
+            console.error("Adding track to playlist failed:", error);
+            if (stateElement) {
+                stateElement.textContent = "Ошибка";
+            }
+        }
+    });
+
+    playlistMenuClose?.addEventListener("click", closePlaylistMenu);
+
+    playlistMenuNew?.addEventListener("click", async () => {
+        if (!playlistMenuTrack) {
+            return;
+        }
+
+        const title = askPlaylistTitle();
+        if (!title) {
+            return;
+        }
+
+        const track = playlistMenuTrack;
+        try {
+            const playlist = await createPlaylistRequest(title);
+            await addTrackToPlaylistRequest(playlist.id, track);
+            updatePlaylistCount(playlist.id, 1);
+            haptic("medium");
+        } catch (error) {
+            console.error("Creating playlist for track failed:", error);
+        } finally {
+            closePlaylistMenu();
+        }
+    });
+
+    async function loadFavorites({ force = false, quiet = false } = {}) {
         if (favoritesLoading && !force) {
             return;
         }
@@ -830,11 +1854,22 @@
         const requestId = ++favoritesRequestId;
         const revision = favoritesRevision;
         favoritesLoading = true;
-        setLibraryLoading(true);
+        if (!quiet) {
+            setLibraryLoading(true);
+        }
 
-        if (libraryEmpty && !favoritesLoaded) {
+        if (!quiet && libraryEmpty && !favoritesLoaded) {
             libraryEmpty.hidden = true;
         }
+
+        // A newer list request cancels the previous one so the catch-up
+        // refresh never doubles the HTTP traffic.
+        if (favoritesAbort) {
+            favoritesAbort.abort();
+            favoritesAbort = null;
+        }
+        const controller = new AbortController();
+        favoritesAbort = controller;
 
         try {
             const response = await fetch(
@@ -844,6 +1879,7 @@
                 {
                     cache: "no-store",
                     headers: apiHeaders(),
+                    signal: controller.signal,
                 }
             );
 
@@ -856,7 +1892,12 @@
                 return;
             }
             if (revision !== favoritesRevision || pendingLikeRequests.size) {
-                // A like/unlike is in flight; keep the optimistic local state.
+                // Either likes are still in flight (they always win) or the
+                // revision moved since this request was issued: the server
+                // answer cannot be trusted against the optimistic local
+                // state. Arm the catch-up reload for the moment the in-flight
+                // like set drains.
+                favoritesCatchUpPending = true;
                 return;
             }
 
@@ -868,13 +1909,23 @@
                 tracks.map((track) => [track.track_id, track])
             );
             favoritesLoaded = true;
+            favoritesCatchUpPending = false;
             renderLibrary();
             syncLikeUI();
         } catch (error) {
-            if (requestId !== favoritesRequestId) {
+            if (
+                requestId !== favoritesRequestId ||
+                error?.name === "AbortError"
+            ) {
+                // Aborted: a newer loadFavorites supersedes this request.
                 return;
             }
             console.error("Favorites load failed:", error);
+            if (quiet) {
+                // A silent catch-up reload must not flash error states into
+                // an already rendered library.
+                return;
+            }
 
             if (!favoritesLoaded) {
                 if (libraryCount) {
@@ -887,11 +1938,39 @@
                 renderLibrary();
             }
         } finally {
+            forgetFavoritesAbort(controller);
             if (requestId === favoritesRequestId) {
                 favoritesLoading = false;
-                setLibraryLoading(false);
+                if (!quiet) {
+                    setLibraryLoading(false);
+                }
             }
         }
+    }
+
+    function forgetFavoritesAbort(controller) {
+        if (favoritesAbort === controller) {
+            favoritesAbort = null;
+        }
+    }
+
+    /**
+     * Fire the "catch-up" favorites reload once every in-flight like/unlike
+     * finished. Until then the optimistic local state is authoritative, so
+     * the reconciling request is postponed, not dropped. The reconciled
+     * answer carries the server's settled state and still loses to any like
+     * started later (the revision guard in loadFavorites keeps that rule).
+     */
+    function reconcileFavorites() {
+        if (pendingLikeRequests.size) {
+            favoritesCatchUpPending = true;
+            return;
+        }
+        if (!favoritesCatchUpPending) {
+            return;
+        }
+        favoritesCatchUpPending = false;
+        loadFavorites({ force: true, quiet: true });
     }
 
     function favoritePayload(track) {
@@ -978,6 +2057,7 @@
         } finally {
             pendingLikeRequests.delete(trackId);
             button?.removeAttribute("aria-busy");
+            reconcileFavorites();
         }
     }
 
@@ -1026,12 +2106,14 @@
             PlayerState.queue = tracks;
             PlayerState.currentIndex = index;
             markCurrentCard();
+            savePlayerState();
             return;
         }
 
         PlayerState.queue = tracks;
         PlayerState.currentIndex = -1;
         markCurrentCard();
+        savePlayerState();
     }
 
     function setQueue(tracks, startIndex = -1) {
@@ -1056,6 +2138,8 @@
             PlayerState.currentIndex = -1;
             markCurrentCard();
         }
+
+        savePlayerState({ force: true });
     }
 
     /* ---------- Track UI ---------- */
@@ -1157,7 +2241,16 @@
         heart.dataset.lucide = "heart";
         like.append(heart);
 
-        card.append(cover, body, duration, like);
+        const add = document.createElement("button");
+        add.className = "track-card__add";
+        add.type = "button";
+        add.setAttribute("aria-label", `Добавить «${track.title}» в плейлист`);
+
+        const addGlyph = document.createElement("i");
+        addGlyph.dataset.lucide = "list-plus";
+        add.append(addGlyph);
+
+        card.append(cover, body, duration, like, add);
         return card;
     }
 
@@ -1272,7 +2365,7 @@
         }
     }
 
-    function playTrack(index) {
+    function playTrack(index, { resumePosition = 0 } = {}) {
         const track = PlayerState.queue[index];
         if (!track?.track_id) {
             return;
@@ -1290,10 +2383,17 @@
         updateMediaSession(track);
         updatePositionState(0, 0, true);
 
+        // Restored-from-storage position: consumed once, as soon as the
+        // track metadata arrives (seeking earlier is unreliable).
+        pendingSeekSeconds =
+            Number(resumePosition) > 0 ? Number(resumePosition) : 0;
+
         const playPromise = audio.play();
         if (playPromise?.catch) {
             playPromise.catch(handlePlaybackFailure);
         }
+
+        savePlayerState({ force: true, position: pendingSeekSeconds });
     }
 
     function replayCurrent() {
@@ -1321,7 +2421,15 @@
         }
 
         if (!audio.src) {
-            playTrack(PlayerState.currentIndex);
+            // A restored queue has no source yet: resume the saved position
+            // when the tracked track matches the restored current one.
+            const track = PlayerState.queue[PlayerState.currentIndex];
+            const resumePosition =
+                pendingResume?.trackId === track?.track_id
+                    ? pendingResume.position
+                    : 0;
+            pendingResume = null;
+            playTrack(PlayerState.currentIndex, { resumePosition });
             return;
         }
 
@@ -1483,6 +2591,7 @@
         }
 
         haptic();
+        markUserPlaybackAction();
         if (previousCurrentId && previousCurrentId === trackId) {
             PlayerState.currentIndex = index;
             togglePlay();
@@ -1531,6 +2640,19 @@
     function handleMetadata() {
         updateTimeline();
         updatePositionState(undefined, audio.currentTime, true);
+
+        if (pendingSeekSeconds > 0) {
+            let target = pendingSeekSeconds;
+            pendingSeekSeconds = 0;
+            if (Number.isFinite(audio.duration) && audio.duration > 0) {
+                target = Math.min(target, Math.max(0, audio.duration - 0.5));
+            }
+            try {
+                audio.currentTime = target;
+            } catch {
+                // The source may not be seekable yet; playback stays at 0.
+            }
+        }
     }
 
     function syncVolumeUI() {
@@ -1671,6 +2793,7 @@
 
         const handlers = {
             play: () => {
+                markUserPlaybackAction();
                 if (PlayerState.currentIndex === -1 || !audio.src) {
                     togglePlay();
                 } else {
@@ -1738,12 +2861,17 @@
         if (!audio.ended) {
             setMediaPlaybackState("paused");
         }
+        // Pause is a natural save point: flush the position immediately so
+        // a reload never resumes at a stale offset.
+        savePlayerState({ force: true });
     });
 
     audio.addEventListener("timeupdate", () => {
         if (!isSeeking) {
             updateTimeline();
         }
+        // Throttled inside savePlayerState (~once per 5 seconds).
+        savePlayerState();
     });
 
     audio.addEventListener("loadedmetadata", handleMetadata);
@@ -1786,8 +2914,28 @@
     collapsePlayer?.addEventListener("click", closePlayer);
 
     document.addEventListener("keydown", (event) => {
-        if (event.key === "Escape") {
-            closePlayer();
+        if (event.key !== "Escape") {
+            return;
+        }
+        if (playlistMenu && !playlistMenu.hidden) {
+            closePlaylistMenu();
+            return;
+        }
+        if (searchHistoryShown) {
+            hideSearchHistory();
+            return;
+        }
+        closePlayer();
+    });
+
+    // Best-effort flush when the Mini App is closed or reloaded.
+    function flushPlayerState() {
+        savePlayerState({ force: true });
+    }
+    window.addEventListener("pagehide", flushPlayerState);
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") {
+            flushPlayerState();
         }
     });
 
@@ -1795,26 +2943,31 @@
 
     miniPlay?.addEventListener("click", () => {
         haptic();
+        markUserPlaybackAction();
         togglePlay();
     });
 
     playButton?.addEventListener("click", () => {
         haptic();
+        markUserPlaybackAction();
         togglePlay();
     });
 
     miniNext?.addEventListener("click", () => {
         haptic();
+        markUserPlaybackAction();
         nextTrack();
     });
 
     nextButton?.addEventListener("click", () => {
         haptic();
+        markUserPlaybackAction();
         nextTrack();
     });
 
     prevButton?.addEventListener("click", () => {
         haptic();
+        markUserPlaybackAction();
         prevTrack();
     });
 
@@ -1824,6 +2977,8 @@
             "aria-pressed",
             String(PlayerState.isShuffle)
         );
+        markUserPlaybackAction();
+        savePlayerState({ force: true });
         haptic();
     });
 
@@ -1840,6 +2995,8 @@
             "aria-label",
             repeatLabels[PlayerState.repeatMode]
         );
+        markUserPlaybackAction();
+        savePlayerState({ force: true });
         haptic();
     });
 
@@ -1917,6 +3074,22 @@
     /* ---------- Favorites: like buttons ---------- */
 
     document.addEventListener("click", (event) => {
+        const addButton = event.target.closest(
+            ".track-card__add, #full-add-playlist"
+        );
+        if (addButton) {
+            const card = addButton.closest(".track-card");
+            const track = card
+                ? getTrackFromCard(card)
+                : PlayerState.queue[PlayerState.currentIndex];
+            if (track?.track_id) {
+                event.preventDefault();
+                event.stopPropagation();
+                openPlaylistMenu(track);
+            }
+            return;
+        }
+
         const button = event.target.closest(
             ".track-card__like, #full-like"
         );
@@ -1941,7 +3114,10 @@
 
     function setupTrackListInteractions(list) {
         list?.addEventListener("click", (event) => {
-            if (event.target.closest(".track-card__like")) {
+            if (
+                event.target.closest(".track-card__like") ||
+                event.target.closest(".track-card__add")
+            ) {
                 return;
             }
             const card = event.target.closest(".track-card");
@@ -1954,7 +3130,10 @@
             if (event.key !== "Enter" && event.key !== " ") {
                 return;
             }
-            if (event.target.closest(".track-card__like")) {
+            if (
+                event.target.closest(".track-card__like") ||
+                event.target.closest(".track-card__add")
+            ) {
                 return;
             }
             const card = event.target.closest(".track-card");
@@ -1968,6 +3147,7 @@
 
     setupTrackListInteractions(trackList);
     setupTrackListInteractions(libraryList);
+    setupTrackListInteractions(playlistTracksList);
 
     /* ---------- Init ---------- */
 
@@ -1980,6 +3160,10 @@
     setupMarquee();
     setupMediaSession();
     checkApi();
+
+    // Restore the previous session's queue/position/modes *before* the
+    // catalog loads, always paused (WebView forbids autoplay anyway).
+    restoreSavedPlayerState();
     restoreCloudVolume();
     syncVolumeUI();
     loadFavorites();
@@ -2007,5 +3191,16 @@
         renderLibrary,
         toggleFavorite,
         isFavorite,
+        savePlayerState,
+        restoreSavedPlayerState,
+        loadSearchHistory,
+        loadPlaylists,
+        openPlaylist,
+        playPlaylist,
+        createPlaylist,
+        deletePlaylist,
+        openPlaylistMenu,
+        closePlaylistMenu,
+        activateLibraryView,
     };
 })();

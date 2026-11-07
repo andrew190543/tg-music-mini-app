@@ -7,3 +7,6 @@ data/
 *.db
 *.db-wal
 *.db-shm
+
+# Local serveo tunnel helper (machine-specific one-liner).
+start-server

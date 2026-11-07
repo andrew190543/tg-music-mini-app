@@ -260,6 +260,16 @@ class Database:
             "DELETE FROM search_history WHERE user_id = ?", (int(user_id),)
         )
 
+    async def delete_search_query(self, user_id: int, query: str) -> int:
+        """Delete every occurrence of one query; return the removed count."""
+        cleaned = " ".join(str(query or "").split())
+        if not cleaned:
+            return 0
+        return await self._execute(
+            "DELETE FROM search_history WHERE user_id = ? AND query = ?",
+            (int(user_id), cleaned),
+        )
+
     # ------------------------------------------------------------------ playlists
 
     async def create_playlist(self, user_id: int, title: str) -> dict[str, Any]:
@@ -318,6 +328,10 @@ class Database:
             (int(playlist_id), int(user_id)),
         )
         return changed > 0
+
+    async def playlist_owned(self, user_id: int, playlist_id: int) -> bool:
+        """Return True when the playlist exists and belongs to the user."""
+        return await self._playlist_owned(user_id, playlist_id)
 
     async def _playlist_owned(self, user_id: int, playlist_id: int) -> bool:
         row = await self._fetch_one(

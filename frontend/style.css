@@ -195,9 +195,11 @@ svg {
     position: relative;
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 6px;
     height: 48px;
-    padding: 0 12px;
+    /* Symmetric 10px insets on both sides: the icon and the clear button are
+       both 28px boxes, so their centers mirror each other perfectly. */
+    padding: 0 10px;
     border-radius: 15px;
     border: 1px solid var(--border);
     background: var(--surface);
@@ -210,18 +212,45 @@ svg {
 }
 
 .search-field__icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 0;
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
     color: var(--tg-hint);
+}
+
+.search-field__icon svg,
+.search-field__icon i {
+    width: 18px;
+    height: 18px;
+    display: block;
+    margin: auto;
+    flex-shrink: 0;
 }
 
 .search-field__input {
     flex: 1 1 auto;
     min-width: 0;
     height: 100%;
-    border: 0;
-    outline: 0;
+    /* The rounded capsule is the only focus surface: kill every native
+       focus/caret rectangle the UA draws around the bare input. */
+    outline: none !important;
+    border: none !important;
+    box-shadow: none !important;
     background: transparent;
     color: var(--tg-text);
     font-size: 15px;
+}
+
+.search-field__input:focus,
+.search-field__input:focus-visible {
+    outline: none !important;
+    border: none !important;
+    box-shadow: none !important;
+    background: transparent;
 }
 
 .search-field__input::placeholder {
@@ -230,18 +259,34 @@ svg {
 
 .search-field__input::-webkit-search-cancel-button,
 .search-field__input::-webkit-search-decoration {
-    display: none;
+    -webkit-appearance: none;
+    appearance: none;
+    display: none !important;
 }
 
 .search-field__clear {
-    display: grid;
-    place-items: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 0;
     width: 28px;
     height: 28px;
+    flex-shrink: 0;
     border-radius: 50%;
+    padding: 0;
+    margin: 0;
     color: var(--tg-hint);
     background: var(--surface-soft);
     transition: color 0.18s ease, background 0.18s ease;
+}
+
+.search-field__clear svg,
+.search-field__clear i {
+    width: 16px;
+    height: 16px;
+    display: block;
+    margin: auto;
+    flex-shrink: 0;
 }
 
 .search-field__clear:hover,
@@ -251,7 +296,93 @@ svg {
 }
 
 .search-field__clear[hidden] {
+    display: none !important;
+}
+
+/* ---------- Search history chips ---------- */
+
+.search-history {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    padding: 10px 12px 12px;
+    border-radius: 15px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+}
+
+.search-history[hidden] {
     display: none;
+}
+
+.search-history__row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.search-history__label {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--tg-hint);
+}
+
+.search-history__clear {
+    padding: 4px 8px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--tg-link);
+    transition: background 0.18s ease;
+}
+
+.search-history__clear:hover,
+.search-history__clear:focus-visible {
+    background: var(--surface-soft);
+}
+
+.search-history__chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.search-history__chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    padding: 7px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface-soft);
+    color: var(--tg-text);
+    font-size: 13px;
+    font-weight: 500;
+    transition: border-color 0.18s ease, background 0.18s ease;
+}
+
+.search-history__chip:hover,
+.search-history__chip:focus-visible {
+    border-color: color-mix(in srgb, var(--tg-button) 55%, transparent);
+    background: color-mix(in srgb, var(--tg-button) 10%, transparent);
+}
+
+.search-history__chip svg {
+    width: 0.85rem;
+    height: 0.85rem;
+    color: var(--tg-hint);
+}
+
+.search-history__chip span {
+    min-width: 0;
+    max-width: 220px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* ---------- Tabs ---------- */
@@ -568,6 +699,282 @@ svg {
     transform: scale(0.9);
 }
 
+.track-card__add {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    color: var(--tg-hint);
+    transition: color 0.18s ease, background 0.18s ease, transform 0.18s ease;
+}
+
+.track-card__add:hover {
+    color: var(--tg-text);
+    background: var(--surface-soft);
+}
+
+.track-card__add:active {
+    transform: scale(0.9);
+}
+
+/* ---------- Library switch (favorites / playlists) ---------- */
+
+.library-switch {
+    margin-bottom: 14px;
+}
+
+/* ---------- Playlists ---------- */
+
+.playlists-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 0 2px 12px;
+}
+
+.playlists-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.playlists-list[aria-busy="true"] {
+    opacity: 0.6;
+}
+
+.playlist-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-soft);
+    cursor: pointer;
+    transition: background 0.18s ease, border-color 0.18s ease,
+        transform 0.18s ease;
+}
+
+.playlist-card:hover,
+.playlist-card:focus-visible {
+    background: var(--surface);
+    border-color: var(--border-strong);
+    outline: none;
+}
+
+.playlist-card:active {
+    transform: scale(0.995);
+}
+
+.playlist-card__icon {
+    display: grid;
+    place-items: center;
+    width: 46px;
+    height: 46px;
+    flex: 0 0 auto;
+    border-radius: 12px;
+    color: rgba(255, 255, 255, 0.94);
+    background: linear-gradient(140deg, var(--tg-button), var(--tg-link));
+}
+
+.playlist-card__icon svg {
+    width: 1.25rem;
+    height: 1.25rem;
+}
+
+.playlist-card__body {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.playlist-card__title {
+    margin: 0;
+    font-size: 14.5px;
+    font-weight: 600;
+    line-height: 1.3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.playlist-card__meta {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--tg-hint);
+}
+
+.playlist-card__play,
+.playlist-card__delete {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    color: var(--tg-hint);
+    transition: color 0.18s ease, background 0.18s ease;
+}
+
+.playlist-card__play:hover {
+    color: var(--tg-text);
+    background: var(--surface-soft);
+}
+
+.playlist-card__delete:hover {
+    color: #ff6b6b;
+    background: color-mix(in srgb, #ff6b6b 10%, transparent);
+}
+
+/* ---------- Playlist tracks view ---------- */
+
+.playlist-tracks-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 2px 2px 12px;
+}
+
+.playlist-tracks-header__text {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.playlist-tracks-header__text .section-heading__title {
+    font-size: 17px;
+}
+
+.playlist-tracks-header__text .section-heading__eyebrow {
+    margin: 0;
+}
+
+/* ---------- "Add to playlist" sheet ---------- */
+
+.playlist-menu {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+}
+
+.playlist-menu[hidden] {
+    display: none;
+}
+
+.playlist-menu__backdrop {
+    position: absolute;
+    inset: 0;
+    background: color-mix(in srgb, #000 55%, transparent);
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+}
+
+.playlist-menu__sheet {
+    position: relative;
+    width: 100%;
+    max-width: 480px;
+    margin: 0 12px calc(12px + env(safe-area-inset-bottom, 0px));
+    padding: 14px;
+    border-radius: 18px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    animation: sheet-in 0.22s ease both;
+}
+
+@keyframes sheet-in {
+    from {
+        opacity: 0;
+        transform: translateY(24px);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+.playlist-menu__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 10px;
+    font-size: 15px;
+    font-weight: 700;
+}
+
+.playlist-menu__list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 40vh;
+    overflow-y: auto;
+}
+
+.playlist-menu__item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 12px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--surface-soft);
+    font-size: 14px;
+    text-align: left;
+    transition: border-color 0.18s ease, background 0.18s ease;
+}
+
+.playlist-menu__item:hover,
+.playlist-menu__item:focus-visible {
+    border-color: color-mix(in srgb, var(--tg-button) 55%, transparent);
+    background: color-mix(in srgb, var(--tg-button) 8%, transparent);
+}
+
+.playlist-menu__item svg {
+    width: 1.1rem;
+    height: 1.1rem;
+    color: var(--tg-hint);
+}
+
+.playlist-menu__item-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.playlist-menu__item-state {
+    flex: 0 0 auto;
+    font-size: 12px;
+    font-weight: 600;
+    color: #2ecc71;
+    white-space: nowrap;
+}
+
+.playlist-menu__item.is-busy {
+    opacity: 0.6;
+}
+
+.playlist-menu__empty {
+    margin: 4px 2px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--tg-hint);
+}
+
+.playlist-menu__new {
+    width: 100%;
+    margin-top: 10px;
+}
+
 /* ---------- Empty state / hints ---------- */
 
 .empty-state {
@@ -637,21 +1044,12 @@ svg {
     border: 1px solid var(--border);
 }
 
-.library-hint {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    margin-top: 26px;
-    padding: 12px 14px;
-    border-radius: var(--radius-sm);
-    border: 1px dashed var(--border-strong);
+.button--compact {
+    margin: 0;
+    padding: 7px 12px;
     font-size: 12.5px;
-    line-height: 1.45;
-    color: var(--tg-hint);
-}
-
-.library-hint svg {
-    color: var(--tg-button);
+    gap: 6px;
+    border-radius: 10px;
 }
 
 /* ---------- Player dock (fixed bottom) ---------- */
@@ -895,6 +1293,12 @@ svg {
     align-items: center;
     gap: 2px;
     min-width: 0;
+}
+
+.full-player__actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
 }
 
 .full-player__eyebrow {

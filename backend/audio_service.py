@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 import time
 from collections.abc import AsyncIterator, Mapping
@@ -42,6 +43,12 @@ TRENDING_RESOLVE_POOL_SIZE = 8
 TRENDING_MIN_TRACK_SECONDS = 90
 TRENDING_MAX_TRACK_SECONDS = 330
 TRENDING_CACHE_TTL_SECONDS = 30 * 60
+# Candidate/rotation tuning: the chart pool is wide (so every 30-minute
+# cycle can pick a different 20), but only one small batch is actually
+# resolved through yt-dlp per cycle.
+TRENDING_ROTATE_INTERVAL_SECONDS = 30 * 60
+TRENDING_CANDIDATE_POOL_SIZE = 60
+TRENDING_RESOLVE_BATCH_SIZE = 25
 # Timeouts for the three stages of a cache refresh (chart fetch, per-song
 # resolution, fallback search). The refresh runs in the background, so these
 # bound how long a wedged refresh can occupy the single-flight slot.
@@ -107,6 +114,22 @@ TRENDING_FALLBACK_QUERIES = (
     "Ваня Дмитриенко - Венера-Юпитер official audio",
     "Artik & Asti - Девочка, танцуй official audio",
     "Гио Пика - Космос official audio",
+    "Feduk Элджей - Розовое вино official audio",
+    "Miyagi Эндшпиль - I Got Love official audio",
+    "GAYAZOV$ BROTHER$ - Увезите меня на Дип-хаус official audio",
+    "Джизус - Малиновая Лада official audio",
+    "Мари Краймбрери - Пряталась в ванной official audio",
+    "Дора - Младший лейтенант official audio",
+    "Валентин Стрыкало - Наше лето official audio",
+    "Мукка - Девочка с каре official audio",
+    "Тима Белорусских - Мокрые кроссы official audio",
+    "Время и Стекло - На стиле official audio",
+    "Руки Вверх - Крошка моя official audio",
+    "Земфира - Искала official audio",
+    "Би-2 - Полковнику никто не пишет official audio",
+    "Сплин - Выхода нет official audio",
+    "Мумий Тролль - Утекай official audio",
+    "Баста - Сансара official audio",
 )
 
 BROWSER_USER_AGENT = (
@@ -654,11 +677,22 @@ async def _resolve_chart_items(
 
 
 def _get_trending_from_search_sync(limit: int) -> list[dict[str, Any]]:
-    """Stage 2: one specific RU hit per query so the list stays varied."""
+    """Stage 2: one specific RU hit per query so the list stays varied.
+
+    The wide query pool is rotated by the 30-minute cycle counter, so every
+    refresh starts at a fresh offset and picks a different set of hits
+    instead of always the first `limit` queries in the tuple.
+    """
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
     artist_counts: dict[str, int] = {}
-    for query in TRENDING_FALLBACK_QUERIES:
+    queries = list(TRENDING_FALLBACK_QUERIES)
+    if len(queries) > limit:
+        offset = (int(time.time() // TRENDING_ROTATE_INTERVAL_SECONDS)) % len(
+            queries
+        )
+        queries = queries[offset:] + queries[:offset]
+    for query in queries:
         if len(results) >= limit:
             break
         try:
@@ -718,15 +752,25 @@ async def _refresh_trending_cache(limit: int) -> list[dict[str, Any]]:
     """
     tracks: list[dict[str, Any]] = []
     try:
+        # Stage 1: gather a wide candidate pool (up to ~60 chart entries) so
+        # every 30-minute cycle can pick a different slice of chart hits.
+        # Randomly subsample the batch BEFORE any yt-dlp work: resolving all
+        # 60 candidates would waste resources for the same 20 final tracks.
         chart_items = await asyncio.wait_for(
             asyncio.to_thread(
-                # Ask the chart source for extra entries: some fail the
-                # resolve step, so a larger pool keeps the list full.
                 _get_chart_items_sync,
-                max(limit, 25),
+                TRENDING_CANDIDATE_POOL_SIZE,
             ),
             timeout=TRENDING_CHART_TIMEOUT_SECONDS,
         )
+        if len(chart_items) > TRENDING_RESOLVE_BATCH_SIZE:
+            chart_items = random.sample(
+                chart_items, TRENDING_RESOLVE_BATCH_SIZE
+            )
+        elif chart_items:
+            # A short pool still gets shuffled: each cycle serves the same
+            # hits in a fresh order.
+            random.shuffle(chart_items)
         tracks = await _resolve_chart_items(chart_items, limit)
         if len(tracks) < limit:
             fallback_tracks = await asyncio.wait_for(
@@ -762,6 +806,21 @@ def _start_trending_refresh_locked(limit: int) -> asyncio.Task[list[dict[str, An
     global TRENDING_REFRESH_TASK
     TRENDING_REFRESH_TASK = task
     return task
+
+
+def _rotate_cached_tracks(tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deterministically shuffle the cached pool per 30-minute cycle.
+
+    Uses the cycle counter as the seed, so every request inside the same
+    half-hour serves the same order, and the order itself differs each
+    cycle even before the background refresh replaces the track set.
+    """
+    if len(tracks) < 2:
+        return list(tracks)
+    bucket = int(time.time() // TRENDING_ROTATE_INTERVAL_SECONDS)
+    rotated = list(tracks)
+    random.Random(bucket).shuffle(rotated)
+    return rotated
 
 
 async def get_trending_tracks(limit: int = 20) -> list[dict[str, Any]]:
@@ -802,17 +861,17 @@ async def get_trending_tracks(limit: int = 20) -> list[dict[str, Any]]:
                 and empty_age < TRENDING_EMPTY_RETRY_COOLDOWN_SECONDS
             )
             if cached and cache_age <= TRENDING_CACHE_TTL_SECONDS:
-                return cached[:safe_limit]
+                return _rotate_cached_tracks(cached)[:safe_limit]
             if recently_empty:
                 # No data and the last refresh just failed: honor the cooldown
                 # instead of hammering the upstream sources every request.
-                return cached[:safe_limit]
+                return _rotate_cached_tracks(cached)[:safe_limit]
             task = _start_trending_refresh_locked(safe_limit)
 
         # Stale-while-revalidate: keep serving the previous list even when it
         # is older than the TTL, so the frontend never blocks on the refresh.
         if cached:
-            return cached[:safe_limit]
+            return _rotate_cached_tracks(cached)[:safe_limit]
 
     # Cold start with an empty cache: wait a bounded time for the refresh.
     # asyncio.shield keeps the background task alive on timeout/cancellation.

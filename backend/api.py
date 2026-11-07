@@ -27,7 +27,7 @@ from .audio_service import (
     search_tracks,
     start_audio_stream,
 )
-from .db import Database
+from .db import MAX_SEARCH_HISTORY, Database
 from .telegram_auth import validate_init_data
 
 APP_VERSION = "0.1.0"
@@ -49,6 +49,13 @@ class FavoriteCreate(BaseModel):
     duration: int = Field(default=0, ge=0)
     thumbnail: str = Field(default="", max_length=2000)
     url: str = Field(default="", max_length=2000)
+
+
+class PlaylistCreate(BaseModel):
+    """Payload for creating a playlist (title is trimmed/limited in the db)."""
+
+    user_id: int | None = Field(default=None, gt=0)
+    title: str = Field(min_length=1, max_length=100)
 
 
 def _init_data_from_request(request: Request) -> str:
@@ -91,6 +98,28 @@ def _resolve_user_id(request: Request, fallback_user_id: int | None) -> int:
     return fallback_user_id
 
 
+def _resolve_optional_user_id(
+    request: Request, fallback_user_id: int | None
+) -> int | None:
+    """Resolve the user id for best-effort side effects (search history).
+
+    Unlike :func:`_resolve_user_id` this never rejects the request: search is
+    a public endpoint. In strict initData mode the side effect is simply
+    skipped when the caller cannot be verified; in dev mode (and with
+    ``AUTH_MODE=off``) the explicit fallback id wins.
+    """
+    if get_bot_token() and get_auth_mode() != "off":
+        init_data = _init_data_from_request(request)
+        if not init_data:
+            return None
+        result = validate_init_data(init_data, get_bot_token())
+        if not result.ok:
+            logger.warning("Search history skipped: %s", result.reason)
+            return None
+        return result.user_id
+    return fallback_user_id
+
+
 def _favorite_track(payload: FavoriteCreate) -> dict[str, Any]:
     """Normalize the payload and derive a webpage URL when it is omitted."""
     track_id = payload.track_id.strip()
@@ -110,6 +139,16 @@ def _favorite_track(payload: FavoriteCreate) -> dict[str, Any]:
         "thumbnail": payload.thumbnail.strip(),
         "url": url,
     }
+
+
+async def _store_search_query(
+    database: Database, user_id: int, query: str
+) -> None:
+    """Persist a successful search, skipping an immediately repeated one."""
+    recent = await database.list_search_history(user_id, limit=1)
+    if recent and recent[0].get("query") == query:
+        return
+    await database.add_search_history(user_id, query)
 
 
 def create_app(
@@ -210,10 +249,17 @@ def create_app(
 
     @app.get("/api/search", tags=["music"])
     async def search(
+        request: Request,
         q: Annotated[str, Query(min_length=1, max_length=200)],
         limit: Annotated[int, Query(ge=1, le=50)] = 15,
+        user_id: Annotated[int | None, Query(gt=0)] = None,
     ) -> list[dict[str, Any]]:
-        """Search tracks through yt-dlp and return normalized metadata."""
+        """Search tracks through yt-dlp and return normalized metadata.
+
+        Any identified user (initData in production, ``user_id`` fallback in
+        dev) gets the successful non-empty query saved into its search
+        history; the history step is best-effort and never fails the search.
+        """
         cleaned_query = " ".join(q.split())
         if not cleaned_query:
             raise HTTPException(
@@ -221,9 +267,22 @@ def create_app(
             )
 
         try:
-            return await search_tracks(cleaned_query, limit=limit)
+            tracks = await search_tracks(cleaned_query, limit=limit)
         except AudioServiceError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        # Search succeeded (even with zero results): remember the query.
+        database: Database = request.app.state.db
+        history_user_id = _resolve_optional_user_id(request, user_id)
+        if history_user_id is not None:
+            try:
+                await _store_search_query(database, history_user_id, cleaned_query)
+            except Exception:
+                logger.warning(
+                    "Failed to store search history for %s", history_user_id
+                )
+
+        return tracks
 
     @app.get("/api/trending", tags=["music"])
     async def trending(
@@ -352,6 +411,155 @@ def create_app(
         database: Database = request.app.state.db
         resolved_user_id = _resolve_user_id(request, user_id)
         removed = await database.remove_favorite(resolved_user_id, cleaned_track_id)
+        return {"removed": removed}
+
+    # ------------------------------------------------------ search history
+
+    @app.get("/api/search-history", tags=["history"])
+    async def get_search_history(
+        request: Request,
+        user_id: Annotated[int | None, Query(gt=0)] = None,
+        limit: Annotated[int, Query(ge=1, le=MAX_SEARCH_HISTORY)] = 10,
+    ) -> list[dict[str, Any]]:
+        """Return the user's recent search queries, newest first.
+
+        The resolved limit is additionally clamped to ``MAX_SEARCH_HISTORY``
+        by the repository, so the frontend cannot pull the whole table.
+        """
+        database: Database = request.app.state.db
+        resolved_user_id = _resolve_user_id(request, user_id)
+        return await database.list_search_history(resolved_user_id, limit=limit)
+
+    @app.delete("/api/search-history", tags=["history"])
+    async def delete_search_history(
+        request: Request,
+        user_id: Annotated[int | None, Query(gt=0)] = None,
+        query: Annotated[str | None, Query(max_length=200)] = None,
+    ) -> dict[str, Any]:
+        """Clear the search history, or only one query when ``query`` is set."""
+        cleaned_query = " ".join(query.split()) if query else ""
+
+        database: Database = request.app.state.db
+        resolved_user_id = _resolve_user_id(request, user_id)
+
+        if cleaned_query:
+            deleted = await database.delete_search_query(
+                resolved_user_id, cleaned_query
+            )
+        else:
+            deleted = await database.clear_search_history(resolved_user_id)
+        return {"deleted": deleted}
+
+    # ------------------------------------------------------------ playlists
+
+    @app.get("/api/playlists", tags=["playlists"])
+    async def list_playlists(
+        request: Request,
+        user_id: Annotated[int | None, Query(gt=0)] = None,
+    ) -> list[dict[str, Any]]:
+        """Return the user's playlists with a track count for each."""
+        database: Database = request.app.state.db
+        resolved_user_id = _resolve_user_id(request, user_id)
+        return await database.list_playlists(resolved_user_id)
+
+    @app.post("/api/playlists", tags=["playlists"])
+    async def create_playlist(
+        payload: PlaylistCreate,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Create an empty playlist owned by the resolved user."""
+        database: Database = request.app.state.db
+        resolved_user_id = _resolve_user_id(request, payload.user_id)
+
+        try:
+            playlist = await database.create_playlist(resolved_user_id, payload.title)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        playlist["track_count"] = 0
+        return playlist
+
+    @app.delete("/api/playlists/{playlist_id}", tags=["playlists"])
+    async def delete_playlist(
+        playlist_id: int,
+        request: Request,
+        user_id: Annotated[int | None, Query(gt=0)] = None,
+    ) -> dict[str, bool]:
+        """Delete the user's playlist together with its tracks (cascade)."""
+        database: Database = request.app.state.db
+        resolved_user_id = _resolve_user_id(request, user_id)
+        removed = await database.delete_playlist(resolved_user_id, playlist_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail="Playlist not found")
+        return {"removed": True}
+
+    @app.get("/api/playlists/{playlist_id}/tracks", tags=["playlists"])
+    async def list_playlist_tracks(
+        playlist_id: int,
+        request: Request,
+        user_id: Annotated[int | None, Query(gt=0)] = None,
+    ) -> list[dict[str, Any]]:
+        """Return the playlist's tracks in insertion order."""
+        database: Database = request.app.state.db
+        resolved_user_id = _resolve_user_id(request, user_id)
+        tracks = await database.list_playlist_tracks(resolved_user_id, playlist_id)
+        if tracks is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Playlist not found or not owned by the user",
+            )
+        return tracks
+
+    @app.post("/api/playlists/{playlist_id}/tracks", tags=["playlists"])
+    async def add_playlist_track(
+        playlist_id: int,
+        payload: FavoriteCreate,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Append a track to the end of the playlist (idempotent)."""
+        database: Database = request.app.state.db
+        resolved_user_id = _resolve_user_id(request, payload.user_id)
+        track = _favorite_track(payload)
+
+        try:
+            added = await database.add_track_to_playlist(
+                resolved_user_id, playlist_id, track
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        if added is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Playlist not found or not owned by the user",
+            )
+        return {"added": added, "track": track}
+
+    @app.delete(
+        "/api/playlists/{playlist_id}/tracks/{track_id}", tags=["playlists"]
+    )
+    async def remove_playlist_track(
+        playlist_id: int,
+        track_id: str,
+        request: Request,
+        user_id: Annotated[int | None, Query(gt=0)] = None,
+    ) -> dict[str, bool]:
+        """Remove a track from the user's playlist."""
+        cleaned_track_id = track_id.strip()
+        if not cleaned_track_id:
+            raise HTTPException(status_code=422, detail="track_id is required")
+
+        database: Database = request.app.state.db
+        resolved_user_id = _resolve_user_id(request, user_id)
+
+        if not await database.playlist_owned(resolved_user_id, playlist_id):
+            raise HTTPException(
+                status_code=404,
+                detail="Playlist not found or not owned by the user",
+            )
+        removed = await database.remove_track_from_playlist(
+            resolved_user_id, playlist_id, cleaned_track_id
+        )
         return {"removed": removed}
 
     @app.get("/", include_in_schema=False)

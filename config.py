@@ -9,10 +9,39 @@ from pathlib import Path
 from dotenv import dotenv_values, load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+ENV_PATH = BASE_DIR / ".env"
+
+# Keys present in the .env file when the process started. ``load_dotenv``
+# copies .env-only values verbatim into ``os.environ`` and never refreshes
+# them: the getters below must be able to tell such stale copies apart from
+# genuinely OS-provided variables.
+load_dotenv(ENV_PATH)
+_ENV_FILE_KEYS = frozenset(dotenv_values(ENV_PATH))
 
 DEFAULT_DB_PATH = "data/music.db"
-ENV_PATH = BASE_DIR / ".env"
+DEFAULT_PORT = 8000
+
+
+def _reread_env_value(key: str) -> str:
+    """Return the current value of ``key`` from the live configuration.
+
+    Reading order (first match wins):
+
+    1. a fresh re-read of the ``.env`` file — it is the deployment
+       switchboard and can change at runtime (e.g. the tunnel address moves);
+    2. ``os.environ`` — real OS-level variables, values injected after the
+       process start (tests) and the copy ``load_dotenv()`` made at startup;
+    3. the ``default``.
+    """
+    values = dotenv_values(ENV_PATH)
+    if key in values:
+        return str(values[key] or "")
+    if key in _ENV_FILE_KEYS:
+        # The key used to be in .env, so the ``os.environ`` copy was made by
+        # load_dotenv at startup. Now the key is gone from the file and the
+        # identical live edit is honoured: the stale cache must not win.
+        return ""
+    return os.getenv(key, "")
 
 
 @dataclass(frozen=True)
@@ -38,10 +67,7 @@ def get_webapp_url() -> str:
     The tunnel address can change during the bot lifetime, so it is important
     that ``/start`` does not use the stale value cached by ``load_dotenv``.
     """
-    values = dotenv_values(ENV_PATH)
-    if "WEBAPP_URL" in values:
-        return str(values["WEBAPP_URL"] or "").strip().rstrip("/")
-    return os.getenv("WEBAPP_URL", "").strip().rstrip("/")
+    return _reread_env_value("WEBAPP_URL").strip().rstrip("/")
 
 
 def get_bot_token() -> str:
@@ -51,10 +77,7 @@ def get_bot_token() -> str:
     rotated while the process is running and the API rechecks it on every
     authenticated request.
     """
-    values = dotenv_values(ENV_PATH)
-    if "BOT_TOKEN" in values:
-        return str(values["BOT_TOKEN"] or "").strip()
-    return os.getenv("BOT_TOKEN", "").strip()
+    return _reread_env_value("BOT_TOKEN").strip()
 
 
 def get_auth_mode() -> str:
@@ -65,12 +88,7 @@ def get_auth_mode() -> str:
       ``user_id`` (local development and tests).
     * ``off``  - always use the fallback ``user_id``, even with a token.
     """
-    values = dotenv_values(ENV_PATH)
-    raw = ""
-    if "AUTH_MODE" in values:
-        raw = str(values["AUTH_MODE"] or "").strip().lower()
-    if not raw:
-        raw = os.getenv("AUTH_MODE", "").strip().lower()
+    raw = _reread_env_value("AUTH_MODE").strip().lower()
     return raw if raw in {"auto", "off"} else "auto"
 
 
@@ -79,7 +97,9 @@ def load_settings() -> Settings:
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     webapp_url = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
 
-    raw_port = os.getenv("PORT", "8080").strip() or "8080"
+    raw_port = os.getenv("PORT", str(DEFAULT_PORT)).strip() or str(
+        DEFAULT_PORT
+    )
     try:
         port = int(raw_port)
     except ValueError as exc:

@@ -457,3 +457,392 @@ def test_favorites_auth_mode_off_accepts_explicit_user_id(tmp_path, monkeypatch)
         favorites = client.get("/api/favorites", params={"user_id": 42})
         assert favorites.status_code == 200
         assert [track["track_id"] for track in favorites.json()] == ["abc123"]
+
+
+def test_search_history_recorded_on_search(tmp_path, monkeypatch):
+    """Successful searches with an identified user end up in the history."""
+    app = create_app(db_path=tmp_path / "api.db")
+
+    async def fake_search(query, limit=15):
+        return [
+            {
+                "track_id": "abc",
+                "title": "Song",
+                "artist": "Artist",
+                "duration": 100,
+                "thumbnail": "https://img/cover.jpg",
+            }
+        ]
+
+    monkeypatch.setattr(api_module, "search_tracks", fake_search)
+
+    with TestClient(app) as client:
+        # Without an identified user nothing is stored...
+        assert (
+            client.get("/api/search", params={"q": "anonymous"}).status_code
+            == 200
+        )
+        assert client.get("/api/search-history").status_code == 422
+
+        history = client.get(
+            "/api/search-history", params={"user_id": 42}
+        )
+        assert history.status_code == 200
+        assert history.json() == []
+
+        # ...but an identified search is remembered.
+        assert (
+            client.get(
+                "/api/search", params={"q": "  Daft    Punk  ", "user_id": 42}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                "/api/search", params={"q": "Daft Punk", "user_id": 42}
+            ).status_code
+            == 200
+        )
+
+        history = client.get(
+            "/api/search-history", params={"user_id": 42, "limit": 10}
+        )
+        assert history.status_code == 200
+        queries = [item["query"] for item in history.json()]
+        # The immediately repeated identical query is deduplicated.
+        assert queries == ["Daft Punk"]
+        assert all(item["created_at"] for item in history.json())
+
+        # Failed searches (service error) are not recorded.
+        async def failing_search(query, limit=15):
+            raise AudioServiceError("boom")
+
+        monkeypatch.setattr(api_module, "search_tracks", failing_search)
+        client.get("/api/search", params={"q": "failing", "user_id": 42})
+
+        history = client.get(
+            "/api/search-history", params={"user_id": 42, "limit": 10}
+        )
+        assert [item["query"] for item in history.json()] == ["Daft Punk"]
+
+
+def test_search_history_user_scoped_and_deletion(tmp_path, monkeypatch):
+    app = create_app(db_path=tmp_path / "api.db")
+
+    async def fake_search(query, limit=15):
+        return []
+
+    monkeypatch.setattr(api_module, "search_tracks", fake_search)
+
+    with TestClient(app) as client:
+        for user in (42, 99):
+            for query in ("alpha", "beta"):
+                client.get(
+                    "/api/search",
+                    params={"q": query, "user_id": user},
+                )
+
+        first = client.get("/api/search-history", params={"user_id": 42})
+        assert first.status_code == 200
+        assert [item["query"] for item in first.json()] == ["beta", "alpha"]
+
+        # History is strictly per user.
+        second = client.get("/api/search-history", params={"user_id": 99})
+        assert [item["query"] for item in second.json()] == ["beta", "alpha"]
+
+        # Delete one query only.
+        one = client.delete(
+            "/api/search-history", params={"user_id": 42, "query": "alpha"}
+        )
+        assert one.status_code == 200
+        assert one.json() == {"deleted": 1}
+        assert [
+            item["query"]
+            for item in client.get(
+                "/api/search-history", params={"user_id": 42}
+            ).json()
+        ] == ["beta"]
+        # The other user's history is untouched.
+        assert len(
+            client.get("/api/search-history", params={"user_id": 99}).json()
+        ) == 2
+
+        # Without a query the whole history goes away.
+        everything = client.delete("/api/search-history", params={"user_id": 42})
+        assert everything.status_code == 200
+        assert everything.json() == {"deleted": 1}
+        assert (
+            client.get("/api/search-history", params={"user_id": 42}).json()
+            == []
+        )
+
+
+def test_playlists_crud_and_user_isolation(tmp_path):
+    app = create_app(db_path=tmp_path / "api.db")
+    track_a = {"user_id": 42, "track_id": "yt:a", "title": "Song A", "artist": "A"}
+    track_b = {"user_id": 42, "track_id": "yt:b", "title": "Song B"}
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/playlists", json={"user_id": 42, "title": "  My   Mix  "}
+        )
+        assert created.status_code == 200
+        playlist = created.json()
+        assert playlist["title"] == "My Mix"
+        assert playlist["user_id"] == 42
+        assert playlist["track_count"] == 0
+        playlist_id = playlist["id"]
+
+        # Empty title is rejected.
+        assert (
+            client.post(
+                "/api/playlists", json={"user_id": 42, "title": "   "}
+            ).status_code
+            == 422
+        )
+
+        added = client.post(
+            f"/api/playlists/{playlist_id}/tracks", json=track_a
+        )
+        assert added.status_code == 200
+        assert added.json()["added"] is True
+
+        duplicate = client.post(
+            f"/api/playlists/{playlist_id}/tracks", json=track_a
+        )
+        assert duplicate.status_code == 200
+        assert duplicate.json()["added"] is False
+
+        client.post(f"/api/playlists/{playlist_id}/tracks", json=track_b)
+
+        listing = client.get("/api/playlists", params={"user_id": 42})
+        assert listing.status_code == 200
+        assert len(listing.json()) == 1
+        assert listing.json()[0]["track_count"] == 2
+
+        tracks = client.get(
+            f"/api/playlists/{playlist_id}/tracks", params={"user_id": 42}
+        )
+        assert tracks.status_code == 200
+        assert [track["track_id"] for track in tracks.json()] == ["yt:a", "yt:b"]
+
+        # Another user sees nothing and cannot touch user 42's playlist.
+        assert (
+            client.get("/api/playlists", params={"user_id": 99}).json() == []
+        )
+        assert (
+            client.get(
+                f"/api/playlists/{playlist_id}/tracks",
+                params={"user_id": 99},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                f"/api/playlists/{playlist_id}/tracks",
+                json={**track_a, "user_id": 99},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.delete(
+                f"/api/playlists/{playlist_id}/tracks/yt:a",
+                params={"user_id": 99},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.delete(
+                f"/api/playlists/{playlist_id}", params={"user_id": 99}
+            ).status_code
+            == 404
+        )
+
+        removed = client.delete(
+            f"/api/playlists/{playlist_id}/tracks/yt:a", params={"user_id": 42}
+        )
+        assert removed.status_code == 200
+        assert removed.json() == {"removed": True}
+        assert (
+            client.delete(
+                f"/api/playlists/{playlist_id}/tracks/yt:a",
+                params={"user_id": 42},
+            ).json()["removed"]
+            is False
+        )
+
+        after = client.get(
+            f"/api/playlists/{playlist_id}/tracks", params={"user_id": 42}
+        )
+        assert [track["track_id"] for track in after.json()] == ["yt:b"]
+
+        deleted = client.delete(
+            f"/api/playlists/{playlist_id}", params={"user_id": 42}
+        )
+        assert deleted.status_code == 200
+        assert deleted.json() == {"removed": True}
+        assert client.get("/api/playlists", params={"user_id": 42}).json() == []
+        assert (
+            client.get(
+                f"/api/playlists/{playlist_id}/tracks", params={"user_id": 42}
+            ).status_code
+            == 404
+        )
+
+
+def test_playlists_validation_and_404s(tmp_path):
+    app = create_app(db_path=tmp_path / "api.db")
+
+    with TestClient(app) as client:
+        # Missing/invalid user_id and title.
+        assert client.get("/api/playlists").status_code == 422
+        assert (
+            client.get("/api/playlists", params={"user_id": 0}).status_code
+            == 422
+        )
+        assert client.post("/api/playlists", json={"title": "X"}).status_code == 422
+        assert (
+            client.post(
+                "/api/playlists", json={"user_id": 1, "title": "X" * 101}
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/api/playlists/1/tracks", json={"user_id": 1, "title": "T"}
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/api/playlists/1/tracks",
+                json={"user_id": 1, "track_id": "a", "title": ""},
+            ).status_code
+            == 422
+        )
+
+        assert (
+            client.get(
+                "/api/playlists/999/tracks", params={"user_id": 42}
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/api/playlists/999/tracks",
+                json={"user_id": 42, "track_id": "a", "title": "T"},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.delete(
+                "/api/playlists/999", params={"user_id": 42}
+            ).status_code
+            == 404
+        )
+        assert (
+            client.delete(
+                "/api/playlists/1/tracks/", params={"user_id": 42}
+            ).status_code
+            in (404, 405)
+        )
+
+
+def test_playlists_and_history_strict_init_data_mode(tmp_path, monkeypatch):
+    """With BOT_TOKEN configured, playlists/history follow initData only."""
+    app = create_app(db_path=tmp_path / "api.db")
+    monkeypatch.setattr(api_module, "get_bot_token", lambda: AUTH_BOT_TOKEN)
+
+    auth = {"Authorization": f"tma {_signed_init_data(42)}"}
+    other = {"Authorization": f"tma {_signed_init_data(99)}"}
+
+    async def fake_search(query, limit=15):
+        return [{"track_id": "abc", "title": "Song"}]
+
+    monkeypatch.setattr(api_module, "search_tracks", fake_search)
+
+    with TestClient(app) as client:
+        # No initData -> 401 for both features.
+        assert (
+            client.get("/api/search-history", params={"user_id": 42}).status_code
+            == 401
+        )
+        assert client.get("/api/playlists", params={"user_id": 42}).status_code == 401
+        assert (
+            client.post(
+                "/api/playlists", json={"user_id": 42, "title": "X"}
+            ).status_code
+            == 401
+        )
+
+        # A signed search records the query for the signed user...
+        client.get("/api/search", params={"q": "signed query"}, headers=auth)
+        history = client.get("/api/search-history", headers=auth)
+        assert history.status_code == 200
+        assert [item["query"] for item in history.json()] == ["signed query"]
+        # ...and never leaks into the anonymous fallback space.
+        assert client.get("/api/search-history", params={"user_id": 42}) \
+            .status_code == 401
+
+        created = client.post(
+            "/api/playlists", headers=auth, json={"title": "Mix"}
+        )
+        assert created.status_code == 200
+        playlist_id = created.json()["id"]
+
+        assert (
+            client.post(
+                f"/api/playlists/{playlist_id}/tracks",
+                headers=auth,
+                json={"track_id": "abc", "title": "Song"},
+            ).status_code
+            == 200
+        )
+
+        # Another signed user cannot see or delete user 42's playlist.
+        assert client.get("/api/playlists", headers=other).json() == []
+        assert (
+            client.get(
+                f"/api/playlists/{playlist_id}/tracks", headers=other
+            ).status_code
+            == 404
+        )
+        assert (
+            client.delete(
+                f"/api/playlists/{playlist_id}", headers=other
+            ).status_code
+            == 404
+        )
+
+        assert (
+            client.delete(
+                f"/api/playlists/{playlist_id}", headers=auth
+            ).status_code
+            == 200
+        )
+
+
+def test_frontend_surfaces_playlists_and_search_history(tmp_path):
+    app = create_app(db_path=tmp_path / "api.db")
+
+    with TestClient(app) as client:
+        index = client.get("/app/").text
+        script = client.get("/app/app.js").text
+        styles = client.get("/app/style.css").text
+
+        # The old placeholder is gone; playlists and history chips are in.
+        assert "Плейлисты и история поиска появятся" not in index
+        assert 'id="playlists-list"' in index
+        assert 'id="search-history-chips"' in index
+        assert 'id="playlist-menu"' in index
+        assert 'id="full-add-playlist"' in index
+
+        assert "/api/playlists" in script
+        assert "/api/search-history" in script
+        assert "search-history__chip" in script or "searchHistoryChips" in script
+        assert "apiHeaders()" in script
+
+        assert ".search-history__chip" in styles
+        assert ".playlist-card" in styles
+        assert ".playlist-menu" in styles
+        assert ".library-hint" not in styles

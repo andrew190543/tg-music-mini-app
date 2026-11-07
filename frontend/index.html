@@ -52,6 +52,20 @@
                     </button>
                 </label>
 
+                <div class="search-history" id="search-history" hidden>
+                    <div class="search-history__row">
+                        <span class="search-history__label">Последние запросы</span>
+                        <button
+                            class="search-history__clear"
+                            id="search-history-clear"
+                            type="button"
+                        >
+                            Очистить
+                        </button>
+                    </div>
+                    <div class="search-history__chips" id="search-history-chips"></div>
+                </div>
+
                 <nav class="tabs" role="tablist" aria-label="Разделы">
                     <button
                         class="tab is-active"
@@ -129,29 +143,116 @@
                         <span class="section-heading__meta" id="library-count" aria-live="polite">0 треков</span>
                     </div>
 
-                    <div class="track-list" id="library-list" aria-busy="true"></div>
-
-                    <div class="empty-state empty-state--large" id="library-empty">
-                        <span class="empty-state__icon" aria-hidden="true">
-                            <i data-lucide="heart"></i>
-                        </span>
-                        <h3>Пока пусто</h3>
-                        <p>
-                            Нажимайте на сердечко в результатах поиска —
-                            любимые треки появятся здесь.
-                        </p>
+                    <div class="tabs library-switch" role="tablist" aria-label="Разделы библиотеки">
                         <button
-                            class="button button--ghost"
+                            class="tab is-active"
                             type="button"
-                            data-tab-target="search"
+                            role="tab"
+                            aria-selected="true"
+                            data-library-view="favorites"
                         >
-                            Найти музыку
+                            <i data-lucide="heart" aria-hidden="true"></i>
+                            <span>Избранное</span>
+                        </button>
+                        <button
+                            class="tab"
+                            type="button"
+                            role="tab"
+                            aria-selected="false"
+                            data-library-view="playlists"
+                        >
+                            <i data-lucide="list-music" aria-hidden="true"></i>
+                            <span>Плейлисты</span>
                         </button>
                     </div>
 
-                    <div class="library-hint" id="library-hint">
-                        <i data-lucide="sparkles" aria-hidden="true"></i>
-                        <span>Плейлисты и история поиска появятся в следующих обновлениях.</span>
+                    <div id="library-view-favorites">
+                        <div class="track-list" id="library-list" aria-busy="true"></div>
+
+                        <div class="empty-state empty-state--large" id="library-empty">
+                            <span class="empty-state__icon" aria-hidden="true">
+                                <i data-lucide="heart"></i>
+                            </span>
+                            <h3>Пока пусто</h3>
+                            <p>
+                                Нажимайте на сердечко в результатах поиска —
+                                любимые треки появятся здесь.
+                            </p>
+                            <button
+                                class="button button--ghost"
+                                type="button"
+                                data-tab-target="search"
+                            >
+                                Найти музыку
+                            </button>
+                        </div>
+                    </div>
+
+                    <div id="library-view-playlists" hidden>
+                        <div class="playlists-toolbar">
+                            <span class="section-heading__meta" id="playlists-count" aria-live="polite">
+                                0 плейлистов
+                            </span>
+                            <button
+                                class="button button--ghost button--compact"
+                                id="create-playlist"
+                                type="button"
+                            >
+                                <i data-lucide="plus" aria-hidden="true"></i>
+                                <span>Создать плейлист</span>
+                            </button>
+                        </div>
+
+                        <div class="playlists-list" id="playlists-list" aria-busy="true"></div>
+
+                        <div class="empty-state" id="playlists-empty" hidden>
+                            <span class="empty-state__icon" aria-hidden="true">
+                                <i data-lucide="list-music"></i>
+                            </span>
+                            <h3>Плейлистов пока нет</h3>
+                            <p>
+                                Соберите свои треки в подборки — они сохранятся
+                                в вашей библиотеке.
+                            </p>
+                        </div>
+                    </div>
+
+                    <div id="library-view-playlist-tracks" hidden>
+                        <div class="playlist-tracks-header">
+                            <button
+                                class="icon-button icon-button--ghost"
+                                id="playlist-back"
+                                type="button"
+                                aria-label="К списку плейлистов"
+                            >
+                                <i data-lucide="arrow-left" aria-hidden="true"></i>
+                            </button>
+                            <div class="playlist-tracks-header__text">
+                                <p class="section-heading__eyebrow">Плейлист</p>
+                                <h2 class="section-heading__title" id="playlist-tracks-title">…</h2>
+                            </div>
+                            <button
+                                class="icon-button"
+                                id="playlist-play"
+                                type="button"
+                                aria-label="Воспроизвести плейлист"
+                            >
+                                <i data-lucide="play" aria-hidden="true"></i>
+                            </button>
+                        </div>
+
+                        <div class="track-list" id="playlist-tracks-list"></div>
+
+                        <div class="empty-state" id="playlist-tracks-empty" hidden>
+                            <span class="empty-state__icon" aria-hidden="true">
+                                <i data-lucide="music"></i>
+                            </span>
+                            <h3>Пустой плейлист</h3>
+                            <p>
+                                Добавьте треки кнопкой «＋» в списке поиска
+                                или в полноэкранном плеере.
+                            </p>
+                        </div>
                     </div>
                 </section>
             </div>
@@ -230,15 +331,26 @@
                         <span class="full-player__source">TG Music</span>
                     </div>
 
-                    <button
-                        class="icon-button icon-button--ghost"
-                        id="full-like"
-                        type="button"
-                        aria-label="Добавить в избранное"
-                        aria-pressed="false"
-                    >
-                        <i data-lucide="heart"></i>
-                    </button>
+                    <div class="full-player__actions">
+                        <button
+                            class="icon-button icon-button--ghost"
+                            id="full-add-playlist"
+                            type="button"
+                            aria-label="Добавить в плейлист"
+                        >
+                            <i data-lucide="list-plus"></i>
+                        </button>
+
+                        <button
+                            class="icon-button icon-button--ghost"
+                            id="full-like"
+                            type="button"
+                            aria-label="Добавить в избранное"
+                            aria-pressed="false"
+                        >
+                            <i data-lucide="heart"></i>
+                        </button>
+                    </div>
                 </header>
 
                 <div class="full-player__art">
@@ -340,6 +452,39 @@
                     >
                     <span class="volume__value" id="volume-value">80%</span>
                 </div>
+            </div>
+        </section>
+
+        <section
+            class="playlist-menu"
+            id="playlist-menu"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Добавить в плейлист"
+            hidden
+        >
+            <div class="playlist-menu__backdrop" data-close-playlist-menu></div>
+            <div class="playlist-menu__sheet">
+                <header class="playlist-menu__header">
+                    <span>Добавить в плейлист</span>
+                    <button
+                        class="icon-button icon-button--ghost"
+                        id="playlist-menu-close"
+                        type="button"
+                        aria-label="Закрыть"
+                    >
+                        <i data-lucide="x" aria-hidden="true"></i>
+                    </button>
+                </header>
+                <div class="playlist-menu__list" id="playlist-menu-list"></div>
+                <button
+                    class="button button--ghost playlist-menu__new"
+                    id="playlist-menu-new"
+                    type="button"
+                >
+                    <i data-lucide="plus" aria-hidden="true"></i>
+                    <span>Новый плейлист</span>
+                </button>
             </div>
         </section>
     </div>

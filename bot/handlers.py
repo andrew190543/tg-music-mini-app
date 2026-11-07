@@ -25,6 +25,17 @@ MENU_BUTTON_TEXT = "Плеер"
 
 WebAppUrlSource = str | Callable[[], str]
 
+# Chat scope -> URL of the last MenuButtonWebApp successfully acknowledged
+# by Telegram. ``None`` is the default (all chats) scope. Until the URL
+# changes (e.g. the tunnel moved), ``set_chat_menu_button`` is not repeated:
+# it costs an API round-trip on every ``/start`` otherwise.
+_installed_menu_urls: dict[int | None, str] = {}
+
+
+def reset_menu_button_cache() -> None:
+    """Forget cached menu-button installs (used by tests and diagnostics)."""
+    _installed_menu_urls.clear()
+
 
 def _current_webapp_url(source: WebAppUrlSource) -> str:
     """Resolve either a constant URL or a callable rereading ``.env``."""
@@ -83,8 +94,10 @@ async def configure_menu_button(
 ) -> bool:
     """Install ``MenuButtonWebApp`` for the requested chat (or all chats).
 
-    Returns ``True`` when Telegram acknowledged the update. Configuration
-    failures are logged but never stop the API or the polling loop.
+    Returns ``True`` when Telegram acknowledged the update (or when the same
+    URL was already installed for this chat scope and the call was skipped).
+    Configuration failures are logged but never stop the API or the polling
+    loop.
     """
     menu_button = build_menu_button(webapp_url)
     if menu_button is None:
@@ -94,6 +107,10 @@ async def configure_menu_button(
         )
         return False
 
+    url = menu_button.web_app.url
+    if _installed_menu_urls.get(chat_id) == url:
+        return True
+
     try:
         if chat_id is None:
             await bot.set_chat_menu_button(menu_button=menu_button)
@@ -102,12 +119,14 @@ async def configure_menu_button(
                 chat_id=chat_id,
                 menu_button=menu_button,
             )
-        return True
     except Exception:
         logger.warning(
             "Не удалось установить MenuButtonWebApp", exc_info=True
         )
         return False
+
+    _installed_menu_urls[chat_id] = url
+    return True
 
 
 async def send_welcome(message: Message, webapp_url: str) -> None:
@@ -145,7 +164,8 @@ def build_router(webapp_url: WebAppUrlSource) -> Router:
     @router.message(CommandStart())
     async def start_handler(message: Message) -> None:
         # Re-apply the menu button on demand: this heals setups where the
-        # startup API call failed (for example after a temporary network error).
+        # startup API call failed (for example after a temporary network
+        # error). The per-chat URL cache makes repeated /start calls cheap.
         url = _current_webapp_url(webapp_url)
         bot = getattr(message, "bot", None)
         if bot is not None:
@@ -153,10 +173,9 @@ def build_router(webapp_url: WebAppUrlSource) -> Router:
                 bot, url, chat_id=message.chat.id
             )
             if installed:
-                print(
-                    "INFO: Отправлена кнопка с актуальным URL: "
-                    f"{build_player_url(url)}/",
-                    flush=True,
+                logger.info(
+                    "Кнопка Mini App отправлена с актуальным URL: %s",
+                    build_player_url(url),
                 )
         await send_welcome(message, url)
 
