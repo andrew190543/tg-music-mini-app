@@ -65,6 +65,18 @@
     const playlistTracksList = document.getElementById("playlist-tracks-list");
     const playlistTracksEmpty = document.getElementById("playlist-tracks-empty");
 
+    const waveList = document.getElementById("wave-list");
+    const waveCount = document.getElementById("wave-count");
+    const waveEmpty = document.getElementById("wave-empty");
+    const waveEmptyTitle = document.getElementById("wave-empty-title");
+    const waveEmptyText = document.getElementById("wave-empty-text");
+    const waveMoodChips = document.getElementById("wave-mood-chips");
+    const waveModeMood = document.getElementById("wave-mode-mood");
+    const waveModePersonal = document.getElementById("wave-mode-personal");
+    const waveStartMood = document.getElementById("wave-start-mood");
+    const waveStartPersonal = document.getElementById("wave-start-personal");
+    const waveModeButtons = document.querySelectorAll("[data-wave-mode]");
+
     const playlistMenu = document.getElementById("playlist-menu");
     const playlistMenuList = document.getElementById("playlist-menu-list");
     const playlistMenuClose = document.getElementById("playlist-menu-close");
@@ -1197,6 +1209,379 @@
         }
     });
 
+    /* ---------- My Wave (Моя волна) ---------- */
+
+    const WAVE_LIMIT = 18;
+    // Hard ceiling for the infinite wave queue: the append loop trims at
+    // this many tracks so a long listening session cannot grow memory
+    // without bound.
+    const WAVE_MAX_QUEUE_TRACKS = 120;
+    const WAVE_MOODS = [
+        { vibe: "calm", title: "Спокойный", meta: "Lo-Fi · Ambient" },
+        { vibe: "energetic", title: "Бодрый", meta: "Pop · Dance" },
+        { vibe: "aggressive", title: "Агрессивный", meta: "Phonk · Hard" },
+        { vibe: "sad", title: "Грустный", meta: "Melancholy" },
+    ];
+
+    let waveMode = "mood";
+    let waveVibe = WAVE_MOODS[0]?.vibe || "calm";
+    let waveRequestId = 0;
+    // AbortController of the wave request in flight (/api/wave/*): kept
+    // separate from the search/trending controller so neither stream of
+    // requests can kill the other one.
+    let waveAbort = null;
+    // Which list the queue was built from: "catalog" (search / trending /
+    // library / playlists, loops back to 0 after the last track) or "wave"
+    // ("Моя волна", which never loops — it appends fresh tracks instead).
+    let queueSource = "catalog";
+    // Which wave endpoint produced / should extend the current queue
+    // ("mood" -> /api/wave/mood, "personal" -> /api/wave/personalized).
+    let waveSource = "mood";
+    // Guards the background "append next wave batch" request so rapid
+    // track changes near the queue end cannot fire duplicate fetches; the
+    // in-flight promise is shared until it settles.
+    let waveAppending = false;
+    let wavePendingAppend = null;
+
+    function setWaveMode(mode) {
+        waveMode = mode === "personal" ? "personal" : "mood";
+
+        waveModeButtons.forEach((button) => {
+            const active = button.dataset.waveMode === waveMode;
+            button.classList.toggle("is-active", active);
+            button.setAttribute("aria-selected", String(active));
+        });
+
+        if (waveModeMood) {
+            waveModeMood.hidden = waveMode !== "mood";
+        }
+        if (waveModePersonal) {
+            waveModePersonal.hidden = waveMode !== "personal";
+        }
+    }
+
+    function renderWaveChips() {
+        if (!waveMoodChips) {
+            return;
+        }
+
+        const fragment = document.createDocumentFragment();
+        WAVE_MOODS.forEach((mood) => {
+            const chip = document.createElement("button");
+            chip.className = "wave-chip";
+            chip.type = "button";
+            chip.dataset.vibe = mood.vibe;
+            chip.classList.toggle("is-selected", mood.vibe === waveVibe);
+
+            const title = document.createElement("span");
+            title.className = "wave-chip__title";
+            title.textContent = mood.title;
+
+            const meta = document.createElement("span");
+            meta.className = "wave-chip__meta";
+            meta.textContent = mood.meta;
+
+            chip.append(title, meta);
+            fragment.append(chip);
+        });
+
+        waveMoodChips.replaceChildren(fragment);
+        initIcons();
+    }
+
+    function showWaveSpinner(text = "Собираем волну…") {
+        if (!waveList) {
+            return;
+        }
+
+        if (waveEmpty) {
+            waveEmpty.hidden = true;
+        }
+        waveList.hidden = false;
+
+        const spinner = document.createElement("div");
+        spinner.className = "catalog-spinner";
+
+        const ring = document.createElement("span");
+        ring.className = "catalog-spinner__ring";
+        ring.setAttribute("aria-hidden", "true");
+
+        const label = document.createElement("p");
+        label.className = "catalog-spinner__text";
+        label.textContent = text;
+
+        spinner.append(ring, label);
+        waveList.replaceChildren(spinner);
+        waveList.setAttribute("aria-busy", "true");
+    }
+
+    function hideWaveEmpty() {
+        if (waveEmpty) {
+            waveEmpty.hidden = true;
+        }
+    }
+
+    function showWaveEmpty(title, text) {
+        if (waveEmptyTitle) {
+            waveEmptyTitle.textContent = title;
+        }
+        if (waveEmptyText) {
+            waveEmptyText.textContent = text;
+        }
+        if (waveEmpty) {
+            waveEmpty.hidden = false;
+        }
+    }
+
+    function setWaveCount(text) {
+        if (waveCount) {
+            waveCount.textContent = text;
+        }
+    }
+
+    function waveLaunchButtons() {
+        return [waveStartMood, waveStartPersonal].filter(Boolean);
+    }
+
+    function setWaveButtonsBusy(busy) {
+        waveLaunchButtons().forEach((button) => {
+            if (busy) {
+                if (!button.dataset.idleText) {
+                    button.dataset.idleText = button.textContent || "";
+                }
+                button.disabled = true;
+                button.textContent = "Собираем волну…";
+            } else {
+                button.disabled = false;
+                if (button.dataset.idleText) {
+                    button.textContent = button.dataset.idleText;
+                    delete button.dataset.idleText;
+                }
+            }
+        });
+    }
+
+    async function runWave(url, source = waveSource) {
+        const requestId = ++waveRequestId;
+        if (waveAbort) {
+            waveAbort.abort();
+        }
+        const controller = new AbortController();
+        waveAbort = controller;
+
+        setWaveCount("Генерация…");
+        showWaveSpinner();
+        // Both launch buttons are blocked while a wave is being assembled:
+        // a second click would only add another yt-dlp storm on the backend.
+        setWaveButtonsBusy(true);
+
+        try {
+            const response = await fetch(url, {
+                cache: "no-store",
+                headers: apiHeaders(),
+                signal: controller.signal,
+            });
+
+            if (!response.ok) {
+                throw new Error(`Wave HTTP ${response.status}`);
+            }
+
+            const payload = await response.json();
+            if (requestId !== waveRequestId) {
+                return;
+            }
+
+            const tracks = (Array.isArray(payload) ? payload : [])
+                .map(normalizeTrack)
+                .filter((track) => track.track_id);
+
+            renderTrackList(waveList, tracks);
+            setWaveCount(pluralizeTracks(tracks.length));
+
+            if (tracks.length) {
+                hideWaveEmpty();
+                // The wave is playable right away: the freshly assembled
+                // list becomes the queue and starts from the first track.
+                waveSource = source;
+                queueSource = "wave";
+                markUserPlaybackAction();
+                setQueue(tracks, 0);
+            } else {
+                showWaveEmpty(
+                    "Волна пуста",
+                    "Ничего не подошло — попробуйте другой вайб или запустите волну ещё раз."
+                );
+            }
+        } catch (error) {
+            if (requestId !== waveRequestId || error?.name === "AbortError") {
+                // Aborted: a newer wave request superseded this one.
+                return;
+            }
+            console.error("Wave failed:", error);
+            setWaveCount("Ошибка загрузки");
+
+            if (!waveList?.children.length) {
+                showWaveEmpty(
+                    "Не удалось собрать волну",
+                    "Проверьте подключение к интернету и попробуйте ещё раз."
+                );
+            }
+        } finally {
+            if (waveAbort === controller) {
+                waveAbort = null;
+            }
+            if (requestId === waveRequestId) {
+                waveList?.setAttribute("aria-busy", "false");
+                // Always restored, even after a failure, so the launch
+                // button never stays stuck disabled.
+                setWaveButtonsBusy(false);
+            }
+        }
+    }
+
+    function loadWaveMood() {
+        waveSource = "mood";
+        return runWave(
+            `/api/wave/mood?vibe=${encodeURIComponent(waveVibe)}&limit=${WAVE_LIMIT}`,
+            "mood"
+        );
+    }
+
+    function loadWavePersonal() {
+        waveSource = "personal";
+        return runWave(
+            authenticatedUrl(`/api/wave/personalized?limit=${WAVE_LIMIT}`),
+            "personal"
+        );
+    }
+
+    waveMoodChips?.addEventListener("click", (event) => {
+        const chip = event.target.closest(".wave-chip");
+        if (!chip || activeTab !== "wave") {
+            return;
+        }
+
+        const vibe = chip.dataset.vibe;
+        if (!vibe) {
+            return;
+        }
+
+        const changed = waveVibe !== vibe;
+        waveVibe = vibe;
+        if (changed) {
+            renderWaveChips();
+        }
+        haptic();
+        // No request here on purpose: picking a vibe is a cheap local
+        // switch — only the "Запустить волну" button builds the wave, so
+        // flipping through chips does not hammer the backend with yt-dlp
+        // searches.
+    });
+
+    waveStartMood?.addEventListener("click", () => {
+        haptic("medium");
+        loadWaveMood();
+    });
+
+    waveStartPersonal?.addEventListener("click", () => {
+        haptic("medium");
+        loadWavePersonal();
+    });
+
+    waveModeButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+            setWaveMode(button.dataset.waveMode);
+            haptic();
+        });
+    });
+
+    /* --- Infinite wave: background append ------------------------- */
+
+    function currentWaveUrl() {
+        if (waveSource === "personal") {
+            return authenticatedUrl(
+                `/api/wave/personalized?limit=${WAVE_LIMIT}`
+            );
+        }
+        return `/api/wave/mood?vibe=${encodeURIComponent(waveVibe)}&limit=${WAVE_LIMIT}`;
+    }
+
+    function waveTrackIds() {
+        return new Set(PlayerState.queue.map((track) => track.track_id));
+    }
+
+    function appendWaveCards(tracks) {
+        if (!waveList || !tracks.length) {
+            return;
+        }
+        const startIndex = waveList.querySelectorAll(".track-card").length;
+        const fragment = document.createDocumentFragment();
+        tracks.forEach((track, offset) => {
+            fragment.append(buildTrackCard(track, startIndex + offset));
+        });
+        waveList.append(fragment);
+        initIcons();
+        syncLikeUI();
+        markCurrentCard();
+    }
+
+    /**
+     * Fetch the next wave batch in the background, filter out tracks already
+     * sitting in the queue, append the fresh ones to the queue and paint
+     * their cards at the end of #wave-list. Concurrent callers share one
+     * in-flight request; failures are logged and swallowed — the wave then
+     * simply loops as a fallback (nothing is appended).
+     */
+    async function appendMoreWaveTracks() {
+        if (queueSource !== "wave") {
+            return;
+        }
+        if (waveAppending) {
+            return wavePendingAppend;
+        }
+        waveAppending = true;
+        wavePendingAppend = (async () => {
+            try {
+                const response = await fetch(currentWaveUrl(), {
+                    cache: "no-store",
+                    headers: apiHeaders(),
+                });
+                if (!response.ok) {
+                    throw new Error(`Wave append HTTP ${response.status}`);
+                }
+
+                const payload = await response.json();
+                const known = waveTrackIds();
+                const fresh = (Array.isArray(payload) ? payload : [])
+                    .map(normalizeTrack)
+                    .filter(
+                        (track) =>
+                            track.track_id && !known.has(track.track_id)
+                    );
+
+                const capacity = Math.max(
+                    0,
+                    WAVE_MAX_QUEUE_TRACKS - PlayerState.queue.length
+                );
+                const additions = fresh.slice(0, capacity);
+                if (!additions.length) {
+                    return;
+                }
+
+                PlayerState.queue = PlayerState.queue.concat(additions);
+                appendWaveCards(additions);
+                setWaveCount(pluralizeTracks(PlayerState.queue.length));
+                savePlayerState();
+            } catch (error) {
+                console.error("Wave append failed:", error);
+            } finally {
+                waveAppending = false;
+                wavePendingAppend = null;
+            }
+        })();
+        return wavePendingAppend;
+    }
+
     /* ---------- Now-playing marquee ---------- */
 
     function setupMarquee() {
@@ -1442,7 +1827,14 @@
     }
 
     function authenticatedUrl(path) {
-        return `${path}?user_id=${encodeURIComponent(String(PlayerState.userId))}`;
+        // The path may already carry its own query string (e.g.
+        // "/api/wave/personalized?limit=18"): appending with a literal "?"
+        // would produce "…?limit=18?user_id=…" and FastAPI would try to
+        // parse "18?user_id=…" as a number -> 422. Join with "&" instead.
+        const separator = path.includes("?") ? "&" : "?";
+        return `${path}${separator}user_id=${encodeURIComponent(
+            String(PlayerState.userId)
+        )}`;
     }
 
     function activateLibraryView(name) {
@@ -1733,6 +2125,7 @@
             if (!tracks.length) {
                 return;
             }
+            queueSource = "catalog";
             markUserPlaybackAction();
             setQueue(tracks, 0);
         } catch (error) {
@@ -1790,6 +2183,7 @@
             .map((card) => getTrackFromCard(card))
             .filter((track) => track.track_id);
         if (rendered.length) {
+            queueSource = "catalog";
             markUserPlaybackAction();
             setQueue(rendered, 0);
         }
@@ -2210,6 +2604,9 @@
         if (!trackList) {
             return;
         }
+        // Only search/trending cards sync here: that queue is a normal
+        // looping catalog, never a wave.
+        queueSource = "catalog";
 
         const previousTrack =
             PlayerState.queue[PlayerState.currentIndex] || null;
@@ -2524,6 +2921,13 @@
             playPromise.catch(handlePlaybackFailure);
         }
 
+        // Wave prefetch: while the penultimate or last wave track plays, the
+        // next batch is already being fetched, so the transition into track
+        // #19+ happens seamlessly (nextTrack just awaits the append).
+        if (queueSource === "wave" && index >= PlayerState.queue.length - 2) {
+            void appendMoreWaveTracks();
+        }
+
         savePlayerState({ force: true, position: pendingSeekSeconds });
     }
 
@@ -2584,7 +2988,7 @@
         return next;
     }
 
-    function nextTrack({ fromEnded = false } = {}) {
+    async function nextTrack({ fromEnded = false } = {}) {
         const length = PlayerState.queue.length;
         if (!length) {
             return;
@@ -2608,8 +3012,26 @@
         }
 
         if (next >= length) {
-            // The queue loops: after the last track playback continues from
-            // the first one, keeping the music running without interruption.
+            if (queueSource !== "wave") {
+                // The queue loops: after the last track playback continues
+                // from the first one, keeping the music running without
+                // interruption.
+                next = 0;
+                playTrack(next);
+                return;
+            }
+
+            // "Моя волна" never loops back: instead of restarting from 0
+            // the queue grows in the background with fresh tracks, and the
+            // very next appended track is played. If nothing new arrives
+            // (offline, exhausted backend answer) the wave falls back to
+            // looping so playback does not die.
+            await appendMoreWaveTracks();
+            const grownLength = PlayerState.queue.length;
+            if (grownLength > length) {
+                playTrack(Math.min(next, grownLength - 1));
+                return;
+            }
             next = 0;
         }
 
@@ -2667,6 +3089,11 @@
         if (!trackId) {
             return;
         }
+
+        // "Моя волна" cards belong to the endless wave queue (it appends
+        // new tracks instead of looping); every other list plays as a
+        // normal looping catalog queue.
+        queueSource = card.closest("#wave-list") ? "wave" : "catalog";
 
         const previousCurrentId =
             PlayerState.queue[PlayerState.currentIndex]?.track_id || "";
@@ -3264,6 +3691,7 @@
     setupTrackListInteractions(trackList);
     setupTrackListInteractions(libraryList);
     setupTrackListInteractions(playlistTracksList);
+    setupTrackListInteractions(waveList);
 
     /* ---------- Init ---------- */
 
@@ -3275,6 +3703,11 @@
     initIcons();
     setupMarquee();
     setupMediaSession();
+
+    // "Моя волна": mood chips and the mode switch are rendered up front;
+    // the wave itself is generated on demand (chip pick / run buttons).
+    setWaveMode("mood");
+    renderWaveChips();
 
     // Restore the previous session's queue/position/modes *before* the
     // catalog loads, always paused (WebView forbids autoplay anyway).
@@ -3317,5 +3750,8 @@
         openPlaylistMenu,
         closePlaylistMenu,
         activateLibraryView,
+        loadWaveMood,
+        loadWavePersonal,
+        setWaveMode,
     };
 })();

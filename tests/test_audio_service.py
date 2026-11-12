@@ -665,6 +665,15 @@ async def test_trending_stage1_maps_yandex_chart_to_youtube_ids(monkeypatch):
         lambda params: MultiSearchYDL(yt_responses, queries),
     )
 
+    # The production refresh shuffles a short chart pool (2 valid
+    # candidates here), so the exact-order assertions below flip on a
+    # ~50/50 coin toss between runs. Pin the shuffle inside this test to
+    # keep it deterministic (the assert SHOULD depend on pipeline logic,
+    # not on RNG state leaked from previous tests).
+    monkeypatch.setattr(
+        audio_service.random, "shuffle", lambda items: None
+    )
+
     tracks = await audio_service.get_trending_tracks(limit=20)
 
     assert [track["track_id"] for track in tracks][:2] == ["yt_one", "yt_two"]

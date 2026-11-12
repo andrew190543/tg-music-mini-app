@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import hmac
+import itertools
 import json
 import time
 from urllib.parse import quote
@@ -54,7 +56,7 @@ def test_health_frontend_cors_and_root_redirect(tmp_path):
 
         index = client.get("/app/")
         assert index.status_code == 200
-        assert "TG Music" in index.text
+        assert "<title>Музыка</title>" in index.text
         assert "./app.js" in index.text
         assert 'id="library-list"' in index.text
         assert 'id="player-bar" hidden' in index.text
@@ -63,7 +65,7 @@ def test_health_frontend_cors_and_root_redirect(tmp_path):
 
         script = client.get("/app/app.js")
         assert script.status_code == 200
-        assert "api/health" in script.text
+        assert "/api/stream/" in script.text
         assert "/api/search" in script.text
         assert "/api/trending" in script.text
         assert "/api/favorites" in script.text
@@ -846,3 +848,501 @@ def test_frontend_surfaces_playlists_and_search_history(tmp_path):
         assert ".playlist-card" in styles
         assert ".playlist-menu" in styles
         assert ".library-hint" not in styles
+
+
+def _wave_favorites(client, user_id: int, track_ids: list[str]) -> None:
+    for track_id in track_ids:
+        response = client.post(
+            "/api/favorites",
+            json={
+                "user_id": user_id,
+                "track_id": track_id,
+                "title": f"Song {track_id}",
+                "artist": "Favorite Artist",
+                "duration": 210,
+            },
+        )
+        assert response.status_code == 200
+
+
+def test_wave_mood_endpoint_uses_service(tmp_path, monkeypatch):
+    app = create_app(db_path=tmp_path / "api.db")
+    captured: dict = {}
+
+    async def fake_mood(vibe: str, limit: int):
+        captured["vibe"] = vibe
+        captured["limit"] = limit
+        return [
+            {
+                "track_id": f"{vibe}-{index}",
+                "title": f"Track {index}",
+                "artist": "Wave Artist",
+                "duration": 180 + index,
+                "thumbnail": "",
+            }
+            for index in range(limit)
+        ]
+
+    async def fake_trending(limit: int):
+        return [
+            {
+                "track_id": f"chart-{index}",
+                "title": f"Chart {index}",
+                "artist": "Chart",
+                "duration": 180,
+                "thumbnail": "",
+            }
+            for index in range(limit)
+        ]
+
+    async def failing_mood(vibe: str, limit: int):
+        raise AudioServiceError("Сборка волны заняла слишком много времени")
+
+    monkeypatch.setattr(api_module, "get_trending_tracks", fake_trending)
+    monkeypatch.setattr(api_module, "get_wave_by_mood", fake_mood)
+
+    with TestClient(app) as client:
+        ok = client.get("/api/wave/mood", params={"vibe": "calm", "limit": 18})
+        assert ok.status_code == 200, ok.text
+        assert captured == {"vibe": "calm", "limit": 18}
+        payload = ok.json()
+        assert len(payload) == 18
+        assert payload[0]["track_id"] == "calm-0"
+
+        bad_vibe = client.get(
+            "/api/wave/mood", params={"vibe": "euphoric", "limit": 18}
+        )
+        assert bad_vibe.status_code == 422
+
+        monkeypatch.setattr(api_module, "get_wave_by_mood", failing_mood)
+        broken = client.get("/api/wave/mood", params={"vibe": "sad"})
+        assert broken.status_code == 502
+
+
+def test_wave_personalized_uses_favorites_and_fallback(tmp_path, monkeypatch):
+    app = create_app(db_path=tmp_path / "api.db")
+    calls: dict = {}
+
+    async def fake_personalized(favorites, limit: int):
+        calls["favorites"] = [track.get("track_id") for track in favorites]
+        calls["limit"] = limit
+        if not favorites:
+            # No taste profile: the empty result triggers the API-level
+            # graceful fallback to the trending chart.
+            return []
+        # Echo back the favorites: enough to answer deterministically.
+        return [
+            {
+                "track_id": track_id,
+                "title": f"Personal {track_id}",
+                "artist": "Personal Artist",
+                "duration": 200,
+                "thumbnail": "",
+            }
+            for track_id in calls["favorites"]
+        ]
+
+    async def fake_trending(limit: int):
+        return [
+            {
+                "track_id": f"chart-{index}",
+                "title": f"Chart {index}",
+                "artist": "Chart",
+                "duration": 180,
+                "thumbnail": "",
+            }
+            for index in range(limit)
+        ]
+
+    monkeypatch.setattr(api_module, "get_trending_tracks", fake_trending)
+    monkeypatch.setattr(api_module, "get_wave_personalized", fake_personalized)
+
+    with TestClient(app) as client:
+        _wave_favorites(client, 42, ["yt-like-1", "yt-like-2"])
+
+        ok = client.get(
+            "/api/wave/personalized", params={"limit": 18, "user_id": 42}
+        )
+        assert ok.status_code == 200, ok.text
+        assert calls["limit"] == 18
+        # Newest favorite first (backend order), same pair of tracks.
+        assert sorted(calls["favorites"]) == ["yt-like-1", "yt-like-2"]
+        favorite_tracks = set(calls.get("favorites", []))
+        assert ok.json() and all(
+            track["track_id"] in favorite_tracks for track in ok.json()
+        )
+
+        # The service returned nothing for this user (no favorites): the
+        # graceful trending-chart fallback keeps the wave playable.
+        other_user = client.get(
+            "/api/wave/personalized", params={"limit": 5, "user_id": 43}
+        )
+        assert other_user.status_code == 200, other_user.text
+        assert other_user.json()[0]["track_id"] == "chart-0"
+        assert len(other_user.json()) == 5
+
+    # The database file exists.
+    assert (tmp_path / "api.db").is_file()
+
+
+def test_wave_personalized_soft_user_id_never_422(tmp_path, monkeypatch):
+    app = create_app(db_path=tmp_path / "api.db")
+    seen: list = []
+
+    async def fake_personalized(favorites, limit: int):
+        seen.append(list(favorites))
+        return []
+
+    async def fake_trending(limit: int):
+        return [
+            {
+                "track_id": f"chart-{index}",
+                "title": f"Chart {index}",
+                "artist": "Chart",
+                "duration": 180,
+                "thumbnail": "",
+            }
+            for index in range(limit)
+        ]
+
+    monkeypatch.setattr(api_module, "get_trending_tracks", fake_trending)
+    monkeypatch.setattr(api_module, "get_wave_personalized", fake_personalized)
+
+    with TestClient(app) as client:
+        # A missing, empty, malformed, zero or negative user_id (e.g. the
+        # historic "?limit=18?user_id=…" broken URL) must never fail the
+        # request with 422 or 401: the wave just has no taste profile.
+        variants = (
+            None,
+            "",
+            "not-a-number",
+            "0",
+            "-5",
+        )
+        for raw in variants:
+            params: dict = {"limit": 4}
+            if raw is not None:
+                params["user_id"] = raw
+            response = client.get("/api/wave/personalized", params=params)
+            assert response.status_code == 200, (raw, response.text)
+            assert len(response.json()) == 4
+
+        assert len(seen) == len(variants)
+        assert all(favorites == [] for favorites in seen)
+
+        # A valid explicit user_id still reaches the favourites lookup.
+        _wave_favorites(client, 7, ["yt-al"])
+        ok = client.get(
+            "/api/wave/personalized", params={"limit": 4, "user_id": "7"}
+        )
+        assert ok.status_code == 200
+        assert [track.get("track_id") for track in seen[-1]] == ["yt-al"]
+
+
+def test_wave_personalized_strict_mode_skips_unsigned(tmp_path, monkeypatch):
+    app = create_app(db_path=tmp_path / "api.db")
+    profile_calls: list = []
+
+    async def fake_personalized(favorites, limit: int):
+        profile_calls.append([track.get("track_id") for track in favorites])
+        return []
+
+    async def fake_trending(limit: int):
+        return [
+            {
+                "track_id": f"chart-{index}",
+                "title": f"Chart {index}",
+                "artist": "Chart",
+                "duration": 180,
+                "thumbnail": "",
+            }
+            for index in range(limit)
+        ]
+
+    monkeypatch.setattr(api_module, "get_bot_token", lambda: AUTH_BOT_TOKEN)
+    monkeypatch.setattr(api_module, "get_auth_mode", lambda: "auto")
+    monkeypatch.setattr(api_module, "get_trending_tracks", fake_trending)
+    monkeypatch.setattr(api_module, "get_wave_personalized", fake_personalized)
+
+    with TestClient(app) as client:
+        # Strict initData mode: an unsigned request (even claiming a
+        # foreign user_id) is not rejected with 401/422 — the side effect
+        # (building a taste profile from someone else's favourites) is
+        # simply skipped and the chart covers the answer.
+        anon = client.get(
+            "/api/wave/personalized", params={"limit": 5, "user_id": 999}
+        )
+        assert anon.status_code == 200
+        assert len(anon.json()) == 5
+        assert profile_calls[-1] == []
+
+        signed = client.get(
+            "/api/wave/personalized",
+            params={"limit": 5},
+            headers={"Authorization": f"tma {_signed_init_data(777)}"},
+        )
+        assert signed.status_code == 200
+        assert profile_calls[-1] == []
+
+
+def test_wave_mood_profile_pool_is_randomized(tmp_path, monkeypatch):
+    """The wave backend must keep fresh, wide query pools per vibe."""
+    from backend.audio_service import (
+        WAVE_MOOD_QUERIES,
+        build_taste_profile,
+        get_wave_by_mood,
+    )
+
+    # The wave engine consumes the module's shared PRNG (shuffle/samples):
+    # snapshot and restore its state so later tests (e.g. the trending
+    # order test in test_audio_service.py) keep their expected sequence.
+    import random as random_module
+
+    rng_state = random_module.getstate()
+    try:
+        for vibe, queries in WAVE_MOOD_QUERIES.items():
+            assert len(queries) >= 25, vibe
+            assert len(set(queries)) == len(queries), vibe
+
+        # Deterministic mode without a sample: every ranked artist, fixed
+        # suffix.
+        favorites = [
+            {
+                "track_id": f"t{index}",
+                "artist": f"Artist {index}",
+                "title": "Song",
+            }
+            for index in range(10)
+        ]
+        profile = build_taste_profile(favorites)
+        assert len(profile) == 8
+        assert profile[0] == "Artist 0 official audio"
+
+        # Randomized mode: 5 sampled artists, shuffled wording.
+        sampled = build_taste_profile(favorites, sample_size=5)
+        assert len(sampled) == 5
+        assert all(
+            any(query.startswith(f"Artist {index}") for query in sampled)
+            for index in range(10)
+        ) is False  # only 5 of 10 artists can be present
+
+        handles = {"calm": tuple(f"probe-query-{i}" for i in range(12))}
+        monkeypatch.setattr("backend.audio_service.WAVE_MOOD_QUERIES", handles)
+
+        seen_calls: list[list[str]] = []
+        call_counter = itertools.count()
+
+        async def fake_search(query, limit):
+            seen_calls.append([query])
+            batch = next(call_counter)
+            return [
+                {
+                    "track_id": f"{query}-b{batch}-{index}",
+                    "title": f"Wave {query} {batch} {index}",
+                    "artist": f"Artist {query}-b{batch}-{index}",
+                    "duration": 150,
+                    "thumbnail": "",
+                }
+                for index in range(3)
+            ]
+
+        monkeypatch.setattr("backend.audio_service.search_tracks", fake_search)
+
+        random_module.seed(1)
+        first_batch = asyncio.run(get_wave_by_mood("calm", limit=18))
+        assert len(first_batch) == 18
+        assert seen_calls, "get_wave_by_mood must fire its query batch"
+        # One limited-18 run with 3 tracks per answer needs exactly the
+        # 7-query sketch (3*7 = 21 candidates >= 18), never the whole pool.
+        assert len(seen_calls) == 7
+        assert len({call[0] for call in seen_calls}) == 7
+        sorted_first_calls = sorted(seen_calls)
+
+        # A different seed samples a different sketch: every run of the
+        # wave is fresh instead of repeating the same three queries.
+        seen_calls.clear()
+        random_module.seed(2)
+        second_batch = asyncio.run(get_wave_by_mood("calm", limit=18))
+        assert len(second_batch) == 18
+        assert len(seen_calls) == 7
+        assert sorted(seen_calls) != sorted_first_calls
+
+        # Both runs: randomized track order on top of the merged batches.
+        assert [track["track_id"] for track in first_batch] != [
+            track["track_id"] for track in sorted(
+                first_batch, key=lambda track: track["track_id"]
+            )
+        ]
+    finally:
+        random_module.setstate(rng_state)
+
+
+def test_wave_favorite_parser_and_title_dedupe():
+    from backend.audio_service import _merge_wave_results, _parse_favorite_item, build_taste_profile
+
+    for sep in ("-", "–", "—"):
+        parsed = _parse_favorite_item({"title": f"Miyagi & Andy Panda {sep} Tantra (Official Audio)", "artist": "Hajime"})
+        assert parsed["artist"] == "Miyagi & Andy Panda"
+        assert parsed["title"] == "Tantra"
+        assert "Miyagi & Andy Panda" in build_taste_profile([{"title": f"Miyagi & Andy Panda {sep} Tantra", "artist": "Hajime"}])[0]
+
+    assert _parse_favorite_item({"title": "Artist - slowed phonk song", "artist": "Channel"})["vibe"] == "aggressive"
+    assert _parse_favorite_item({"title": "Artist - lofi ambient", "artist": "Channel"})["vibe"] == "calm"
+    result = _merge_wave_results([[{"track_id": "reupload", "title": "Tantra [Official Video]", "artist": "Other", "duration": 180}]], 2, set(), {"tantra"})
+    assert result == []
+
+
+def test_personal_wave_refills_from_detected_vibe(monkeypatch):
+    import asyncio
+    from backend import audio_service
+
+    calls = []
+    async def fake_search(queries, per_query):
+        calls.extend(queries)
+        return [[{"track_id": f"new-{len(calls)}", "title": f"New song {len(calls)}", "artist": "Artist", "duration": 180}] for _ in queries]
+    monkeypatch.setattr(audio_service, "_wave_search_queries", fake_search)
+    monkeypatch.setattr(audio_service, "_discover_similar_tracks_sync", lambda *args: [])
+    favorites = [{"track_id": "liked", "title": "Artist - lofi song", "artist": "Channel"}]
+    asyncio.run(audio_service.get_wave_personalized(favorites, limit=1))
+    assert calls
+    assert all(query in audio_service.WAVE_MOOD_QUERIES["calm"] for query in calls if query.startswith(tuple(audio_service.WAVE_MOOD_QUERIES["calm"])))
+
+
+def test_personal_wave_style_queries_follow_likes(monkeypatch):
+    """Phonk/slowed likes -> wave fires aggressive style queries, not pop."""
+    import asyncio
+    from backend import audio_service
+
+    calls = []
+
+    async def fake_search(queries, per_query):
+        calls.extend(queries)
+        return [
+            [
+                {
+                    "track_id": f"yt-{len(calls)}-{i}",
+                    "title": f"New track {len(calls)}-{i}",
+                    "artist": f"Performer {len(calls)}-{i}",
+                    "duration": 180,
+                }
+                for i in range(3)
+            ]
+        ]
+
+    monkeypatch.setattr(audio_service, "_wave_search_queries", fake_search)
+    monkeypatch.setattr(audio_service, "_discover_similar_tracks_sync", lambda *args: [])
+    favorites = [
+        {"track_id": "liked-1", "title": "Miyagi & Andy Panda - Tantra (Official Audio)", "artist": "Hajime"},
+        {"track_id": "liked-2", "title": "Kordhell - Murder In My Mind (slowed reverb)", "artist": "zardy"},
+    ]
+    tracks = asyncio.run(audio_service.get_wave_personalized(favorites, limit=10))
+    # Real artist wins over the channel name, vibe = aggressive.
+    assert any("Miyagi" in query for query in calls)
+    assert any(query in audio_service.VIBE_STYLE_QUERIES["aggressive"] for query in calls)
+    # Likes exist: the generic trending pop fallback must never be used.
+    assert not any(query in audio_service.TRENDING_FALLBACK_QUERIES for query in calls)
+    #Liked songs themselves never come back.
+    returned_ids = {track["track_id"] for track in tracks}
+    assert not returned_ids & {"liked-1", "liked-2"}
+
+
+def test_personal_wave_reupload_same_title_filtered(monkeypatch):
+    """A re-upload with a different track_id but the same song title is dropped."""
+    import asyncio
+    from backend import audio_service
+
+    reupload = {
+        "track_id": "other-upload-999",
+        "title": "Tantra (Official Audio 2026)",
+        "artist": "Random Channel",
+        "duration": 180,
+    }
+    fresh = {
+        "track_id": "brand-new-1",
+        "title": "Completely Different Song",
+        "artist": "Other Artist",
+        "duration": 180,
+    }
+
+    async def fake_search(queries, per_query):
+        return [[reupload, fresh] for _ in queries]
+
+    monkeypatch.setattr(audio_service, "_wave_search_queries", fake_search)
+    monkeypatch.setattr(audio_service, "_discover_similar_tracks_sync", lambda *args: [])
+    favorites = [{"track_id": "liked-1", "title": "Miyagi & Andy Panda - Tantra (Official Audio)", "artist": "Hajime"}]
+    tracks = asyncio.run(audio_service.get_wave_personalized(favorites, limit=5))
+    ids = {track["track_id"] for track in tracks}
+    assert "other-upload-999" not in ids
+    assert "liked-1" not in ids
+    assert "brand-new-1" in ids
+
+
+def test_personal_wave_empty_favorites_uses_trending_mix(monkeypatch):
+    """No likes -> mix from every mood pool plus the trending fallback."""
+    import asyncio
+    from backend import audio_service
+
+    calls = []
+
+    async def fake_search(queries, per_query):
+        calls.extend(queries)
+        return [
+            [
+                {
+                    "track_id": f"yt-{len(calls)}-{i}",
+                    "title": f"Fresh {len(calls)}-{i}",
+                    "artist": f"Artist {len(calls)}-{i}",
+                    "duration": 180,
+                }
+                for i in range(3)
+            ]
+        ]
+
+    monkeypatch.setattr(audio_service, "_wave_search_queries", fake_search)
+    all_mood = {q for pool in audio_service.WAVE_MOOD_QUERIES.values() for q in pool}
+    tracks = asyncio.run(audio_service.get_wave_personalized([], limit=15))
+    assert tracks
+    assert calls
+    # Mixes the whole mood space and the trending fallback, not a single vibe.
+    assert any(query in all_mood for query in calls)
+    assert any(query in audio_service.TRENDING_FALLBACK_QUERIES for query in calls)
+
+
+def test_discover_similar_tracks_sync_uses_deezer(monkeypatch):
+    """Deezer discovery: top songs of the liked artist minus already-liked titles."""
+    from backend import audio_service
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, params=None):
+            import types
+
+            def _json():
+                if "search/artist" in url:
+                    return {"data": [{"id": 42}]}
+                if "/top" in url:
+                    return {"data": [
+                        {"id": 1, "title": "Tantra", "artist": {"name": "Miyagi"}, "duration": 200},
+                        {"id": 2, "title": "Utopia", "artist": {"name": "Miyagi"}, "duration": 210},
+                    ]}
+                if "/related" in url:
+                    return {"data": [{"id": 77}]}
+                return {"data": []}
+
+            return types.SimpleNamespace(json=_json)
+
+    monkeypatch.setattr(audio_service.httpx, "Client", FakeClient)
+    discovered = audio_service._discover_similar_tracks_sync(["Miyagi"], {"tantra"}, 10)
+    titles = [track["title"] for track in discovered]
+    # Already-liked "Tantra" is skipped, the other top song comes through.
+    assert not any("Tantra" in title for title in titles)
+    assert any("Utopia" in title for title in titles)
+    assert all(track["track_id"].startswith("deezer:") for track in discovered)

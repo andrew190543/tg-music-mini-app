@@ -898,6 +898,579 @@ async def get_trending_tracks(limit: int = 20) -> list[dict[str, Any]]:
     return list(tracks)[:safe_limit]
 
 
+# ---------------------------------------------------------------------- wave
+
+# The "Моя волна" (My Wave) feature: vibe-driven search and a personalized
+# wave built from the user's favorites. Wave-specific duration window keeps
+# DJ compilations and hour mixes out even when a single title slips past the
+# word filter; the personal list also never repeats tracks the user liked.
+WAVE_MIN_TRACK_SECONDS = 60
+WAVE_MAX_TRACK_SECONDS = 480
+# Diversity cap shared with trending: at most 2 tracks per artist.
+WAVE_MAX_TRACKS_PER_ARTIST = 2
+# Whole-wave budget: every mood fires `len(queries)` parallel yt-dlp searches
+# and each one already enforces SEARCH_TIMEOUT_SECONDS internally.
+WAVE_SEARCH_TIMEOUT_SECONDS = 45.0
+
+# Vibe -> YouTube search queries. The wording matters: a query term such as
+# "mix" would surface mixes/compilations whose titles are then wiped out by
+# TITLE_EXCLUDE_RE, ending with (near) empty pools. Instead of a handful of
+# generic phrases (which YouTube answers with hour-long mixes that get
+# filtered out) each vibe carries a wide pool of point queries — concrete
+# artists and single-track searches, so yt-dlp finds real 2–5 minute songs.
+# ``get_wave_by_mood`` only takes a random 6–7 query sample per run and
+# refills from the rest, so every wave is fresh and never static.
+WAVE_MOOD_QUERIES: dict[str, tuple[str, ...]] = {
+    "calm": (
+        "Øneheart snowfall",
+        "Idealism lofi beats",
+        "Kupla lofi jazzhop",
+        "Jinsang lofi",
+        "Kudasai lofi",
+        "potsu lofi",
+        "Nujabes Feather",
+        "Petit Biscuit Sunset Lover",
+        "Kasbo World I Forgot",
+        "Tycho Awake",
+        "Bonjr lofi",
+        "eevee beats lofi",
+        "mommy lofi beats",
+        "C418 Sweden",
+        "Ludovico Einaudi Experience",
+        "Ólafur Arnalds Near Light",
+        "Nils Frahm Says",
+        "Beach House Space Song",
+        "Cigarettes After Sex Apocalypse",
+        "Men I Trust Show Me How",
+        "Clairo Softly",
+        "Novo Amor Anchor",
+        "Bon Iver Holocene",
+        "Sleeping At Last Saturn",
+        "Aphex Twin Avril 14th",
+        "Reidenshi snowfall",
+        "Antent warm nights",
+        "leadwave dawn",
+        "soft piano melody instrumental",
+        "dreamy ambient track",
+    ),
+    "energetic": (
+        "Dua Lipa Levitating",
+        "The Weeknd Blinding Lights",
+        "Calvin Harris Summer",
+        "David Guetta Titanium",
+        "Zivert Life",
+        "Zivert Fly 2",
+        "ANNA ASTI Царица",
+        "Моя Мишель Зима в сердце",
+        "Artik Asti Девочка, танцуй",
+        "Мари Краймбрери Пряталась в ванной",
+        "Daft Punk Get Lucky",
+        "Disclosure Latch",
+        "Fred again Delilah",
+        "Purple Disco Machine Hypnotized",
+        "Tiësto The Business",
+        "Avicii Wake Me Up",
+        "Röyksopp Happy Up Here",
+        "Justice D.A.N.C.E.",
+        "Bebe Rexha I'm Good",
+        "Peggy Gou Nanana",
+        "Kaytranada 10%",
+        "GAYAZOV$ BROTHER$ Увезите меня на Дип-хаус",
+        "Feduk Элджей Розовое вино",
+        "Miyagi Эндшпиль I Got Love",
+        "Мот Соло",
+        "Время и Стекло На стиле",
+        "Джиган Мятный кэнди",
+        "Drake One Dance",
+        "Mahmut Orhan Feel",
+        "dance house upbeat track",
+    ),
+    "aggressive": (
+        "Kordhell Murder In My Mind",
+        "DVRST Close Eyes",
+        "INTERWORLD METAMORPHOSIS",
+        "Hensonn Sahara",
+        "Pharmacist LIAR",
+        "Ghostemane Mercury Retrograde",
+        "$uicideboy$ Paris",
+        "Scarlxrd 6 Feet",
+        "100 gecs money machine",
+        "Bring Me The Horizon Shadow Moses",
+        "Slaughter To Prevail Demolisher",
+        "Mick Gordon BFG Division",
+        "shadowraze shadow fiend",
+        "zxcursed изнутри",
+        "MoonDeity NEON BLADE",
+        "KSLV Noh Overkill",
+        "Dxrk RAVE",
+        "Kordhell Land of Fire",
+        "PlayaPhonk Scream Scream",
+        "COTIS Look At Me Now",
+        "Lumi Athena Ice Cream So Good",
+        "odecore Alright",
+        "Slowboy Yume",
+        "Vierre Cloud moment",
+        "CITY MORGUE Stick N Move",
+        "sadfriendd Broken",
+        "aggressive drift phonk track",
+    ),
+    "sad": (
+        "Три дня дождя Отпускай",
+        "Три дня дождя Демоны",
+        "Джизус Малиновая Лада",
+        "Джизус Бирюзовая",
+        "Земфира Искала",
+        "Земфира Прогулка",
+        "Сплин Выхода нет",
+        "Кино Группа крови",
+        "Перемотка трек",
+        "Молчат Дома Судно",
+        "дурной вкус трек",
+        "Где Фантом Клюквенный сахар",
+        "Мукка Девочка с каре",
+        "Joji Slow Dancing in the Dark",
+        "Joji Glimpse of Us",
+        "Billie Eilish when the party's over",
+        "Billie Eilish Ocean Eyes",
+        "Lana Del Rey Video Games",
+        "Lana Del Rey Summertime Sadness",
+        "Radiohead Creep",
+        "Radiohead No Surprises",
+        "The Neighbourhood Sweater Weather",
+        "Arctic Monkeys 505",
+        "Arctic Monkeys Do I Wanna Know",
+        "XXXTENTACION Jocelyn Flores",
+        "Lil Peep Star Shopping",
+        "d4vd Romantic Homicide",
+        "Vacations Young",
+        "Mac DeMarco Chamber of Reflection",
+        "melancholy sad indie track",
+    ),
+}
+
+# Style/genre wording derived from what the user actually liked (slowed,
+# reverb, phonk, lofi, post-punk...). These queries are added to the
+# personalized wave's first candidate batch so the wave follows the user's
+# vibe even when the artist searches come up short.
+VIBE_STYLE_QUERIES: dict[str, tuple[str, ...]] = {
+    "aggressive": (
+        "best slowed reverb phonk track",
+        "dark trap slowed audio",
+        "hard phonk audio",
+    ),
+    "calm": (
+        "atmospheric slowed lofi track",
+        "calm ambient piano instrumental",
+    ),
+    "sad": (
+        "melancholy post-punk indie track",
+        "sad acoustic song",
+    ),
+    "energetic": (
+        "dance remix club track",
+        "upbeat house edm track",
+    ),
+}
+
+# Query suffixes alternating in the personalized wave: taste-profile artists
+# are searched once each with a rotating wording so the same artist is not
+# locked into one result pattern.
+TASTE_QUERY_SUFFIXES = ("official audio", "track", "популярные треки")
+
+# Per-run sample sizes: each wave call takes a random handful of queries from
+# the vibe pool (and the taste pool tops up from the trending/mood pools), so
+# consecutive runs produce different, non-repeating track lists.
+WAVE_QUERY_BATCH_SIZE = 7
+WAVE_TOPUP_BATCH_SIZE = 6
+WAVE_TOPUP_MAX_ROUNDS = 8
+
+
+def _clean_favorite_text(value: Any) -> str:
+    text = re.sub(r"[\u200b-\u200f\uFEFF]", "", str(value or ""))
+    text = re.sub(r"(?i)\s*-\s*Topic\b|\bVEVO\b|\bOfficial\s+(?:Audio|Video|Music\s+Video)\b|\bLyrics?\b|\bLyric\s+Video\b", "", text)
+    text = re.sub(r"\([^)]*\)|\[[^]]*\]", "", text)
+    return " ".join(re.sub(r"\*+", " ", text).split()).strip(" -–—")
+
+
+def _parse_favorite_item(fav: Mapping[str, Any]) -> dict[str, Any]:
+    raw_title, raw_artist = str(fav.get("title") or ""), str(fav.get("artist") or "")
+    title = _clean_favorite_text(raw_title)
+    artist = _clean_favorite_text(raw_artist)
+    parts = re.split(r"\s*[-–—]\s*", title, maxsplit=1)
+    real_artist, clean_title = (" ".join(parts[0].split()), " ".join(parts[1].split())) if len(parts) == 2 else (artist, title)
+    source = f"{raw_title} {raw_artist}".lower()
+    vibe = next((v for v, words in (("aggressive", ("slowed", "reverb", "phonk", "drift", "hard", "murder", "rage", "hyperpop", "trap", "zxcursed", "shadowraze")), ("calm", ("lofi", "lo-fi", "ambient", "chill", "snowfall", "piano", "sleep", "instrumental")), ("sad", ("sad", "doomer", "post-punk", "melancholy", "acoustic", "инди", "пост-панк", "грустн")), ("energetic", ("dance", "remix", "club", "house", "pop", "edm"))) if any(w in source for w in words)), "energetic")
+    return {"artist": real_artist, "extra_artist": artist if artist.lower() != real_artist.lower() else "", "title": clean_title, "vibe": vibe}
+
+
+def _normalize_song_title(title: Any) -> str:
+    cleaned = _clean_favorite_text(title).lower()
+    return "".join(re.findall(r"[\w\d]", cleaned, flags=re.UNICODE))
+
+
+def build_taste_profile(
+    favorites: list[dict[str, Any]] | None,
+    max_artists: int = 8,
+    sample_size: int | None = None,
+) -> list[str]:
+    """Derive yt-dlp queries from the user's favorites (pure helper).
+
+    Artists are ranked by how often they appear in the favorites; the top
+    ``max_artists`` distinct (case-insensitive) names become one search each.
+    Tracks without an artist cannot anchor a query and are skipped. An empty
+    (or artist-less) list means "no taste profile" -> the caller falls back.
+
+    With ``sample_size`` set (used by the personalized wave) the profile is
+    randomized per call: up to ``sample_size`` ranked artists are sampled and
+    the wording alternates ("official audio" / "track" / "популярные треки"),
+    producing a shuffled, differently-worded query batch every time. Without
+    it the output stays deterministic ("{artist} official audio") for tests
+    and callers that want a stable profile.
+    """
+    counts: dict[str, dict[str, int]] = {}
+    order: dict[str, str] = {}
+    favorite_ids: set[str] = set()
+
+    for favorite in favorites or []:
+        if not isinstance(favorite, Mapping):
+            continue
+        track_id = str(favorite.get("track_id") or "").strip()
+        if track_id:
+            favorite_ids.add(track_id)
+
+        artist = _parse_favorite_item(favorite)["artist"]
+        artist = " ".join(artist.split())
+        if not artist or len(artist) > 80:
+            continue
+        key = artist.lower()
+        bucket = counts.get(key)
+        if bucket is None:
+            counts[key] = {"count": 1, "length": len(artist)}
+            order[key] = artist
+        else:
+            bucket["count"] = bucket["count"] + 1
+
+    ranked = sorted(
+        counts.items(), key=lambda item: (-item[1]["count"], item[1]["length"])
+    )
+    ranked = ranked[:max_artists]
+    artist_names = [order[key] for key, _ in ranked]
+
+    if sample_size is not None and len(artist_names) > sample_size:
+        artist_names = random.sample(list(artist_names), sample_size)
+
+    profile: list[str] = []
+    for index, artist in enumerate(artist_names):
+        suffix = (
+            TASTE_QUERY_SUFFIXES[index % len(TASTE_QUERY_SUFFIXES)]
+            if sample_size is not None
+            else "official audio"
+        )
+        profile.append(f"{artist} {suffix}")
+
+    if sample_size is not None:
+        random.shuffle(profile)
+    return profile
+
+
+def _is_wave_track(track: Mapping[str, Any]) -> bool:
+    """Wave-level acceptance rules on top of the base search filters."""
+    title = str(track.get("title") or "").strip()
+    if not title or TITLE_EXCLUDE_RE.search(title):
+        return False
+    duration = _coerce_duration(track.get("duration"))
+    if duration <= 0:
+        return False
+    return WAVE_MIN_TRACK_SECONDS <= duration <= WAVE_MAX_TRACK_SECONDS
+
+
+def _merge_wave_results(
+    results: list[Any],
+    limit: int,
+    favorite_ids: set[str] | None = None,
+    favorite_titles: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Merge concurrent search result lists into one curated wave list.
+
+    Drops duplicates by ``track_id``, favorites the user already saved,
+    tracks outside the wave duration window and any artist over the
+    diversity cap. ``results`` may contain non-tracks (exceptions /
+    ``None``) that are silently ignored.
+    """
+    seen = set(favorite_ids or set())
+    title_keys = set(favorite_titles or set())
+    artist_counts: dict[str, int] = {}
+    merged: list[dict[str, Any]] = []
+
+    for result in results:
+        tracks = result if isinstance(result, list) else []
+        for track in tracks:
+            if not isinstance(track, Mapping):
+                continue
+            track_id = str(track.get("track_id") or "").strip()
+            if not track_id or track_id in seen:
+                continue
+            key = _normalize_song_title(track.get("title"))
+            if key and any(key == liked or key in liked or liked in key for liked in title_keys if liked):
+                continue
+            if not _is_wave_track(track):
+                continue
+            artist_key = str(track.get("artist") or "").strip().lower()
+            if (
+                artist_key
+                and artist_counts.get(artist_key, 0)
+                >= WAVE_MAX_TRACKS_PER_ARTIST
+            ):
+                continue
+            if artist_key:
+                artist_counts[artist_key] = (
+                    artist_counts.get(artist_key, 0) + 1
+                )
+            seen.add(track_id)
+            merged.append(
+                {
+                    "track_id": track_id,
+                    "title": str(track.get("title") or "").strip(),
+                    "artist": str(track.get("artist") or "").strip(),
+                    "duration": _coerce_duration(track.get("duration")),
+                    "thumbnail": str(track.get("thumbnail") or "").strip(),
+                }
+            )
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+async def _wave_search_queries(queries: list[str], per_query: int) -> list[Any]:
+    """Run several wave searches in parallel, tolerating partial failures."""
+    async def run_one(query: str) -> list[dict[str, Any]]:
+        return await search_tracks(query, limit=per_query)
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.gather(
+                *(run_one(query) for query in queries), return_exceptions=True
+            ),
+            timeout=WAVE_SEARCH_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError as exc:
+        raise AudioServiceError("Сборка волны заняла слишком много времени и была прервана") from exc
+
+
+def _wave_per_query_limit(limit: int, query_count: int) -> int:
+    """Results to ask per query so the final list reaches ``limit``."""
+    if query_count <= 0:
+        return limit
+    # Filters drop a portion of each pool; ask for extra candidates.
+    per_query = max(SEARCH_POOL_SIZE // 2, (limit // query_count) + 4)
+    return min(per_query, MAX_SEARCH_RESULTS)
+
+
+async def get_wave_by_mood(vibe: str, limit: int = 15) -> list[dict[str, Any]]:
+    """Return a 15-20 track wave matching the requested mood/vibe.
+
+    Every vibe maps to a wide pool of YouTube point-queries (concrete
+    artists and single-track searches) run through the regular
+    :func:`search_tracks` pipeline (filters, timeouts and the worker thread
+    are shared). Each call takes a *random* sample of the pool first and
+    refills with further random batches while the list is still short, so
+    consecutive runs produce fresh, non-repeating waves. If every search
+    fails the service error is propagated.
+    """
+    cleaned_vibe = str(vibe or "").strip().lower()
+    pool = list(WAVE_MOOD_QUERIES.get(cleaned_vibe) or [])
+    if not pool:
+        raise AudioServiceError(f"Неизвестный вайб волны: {vibe!r}")
+
+    try:
+        safe_limit = int(limit)
+    except (TypeError, ValueError):
+        safe_limit = 15
+    safe_limit = max(1, min(safe_limit, MAX_SEARCH_RESULTS))
+
+    # Fresh wave on every run: shuffle the pool and fire a random 6-7 query
+    # sketch instead of the same three queries every time.
+    random.shuffle(pool)
+    first_batch = pool[:WAVE_QUERY_BATCH_SIZE]
+    remaining = pool[len(first_batch):]
+
+    merged = await _wave_search_queries(
+        first_batch, _wave_per_query_limit(safe_limit, len(first_batch))
+    )
+    tracks = _merge_wave_results(merged, safe_limit)
+    random.shuffle(tracks)
+    seen = {track["track_id"] for track in tracks}
+
+    # Filters (duration window, cap per artist) can leave the list short:
+    # refill from untouched random portions of this vibe's pool up to limit.
+    while len(tracks) < safe_limit and remaining:
+        batch = remaining[:WAVE_TOPUP_BATCH_SIZE]
+        remaining = remaining[len(batch):]
+        merged = await _wave_search_queries(
+            batch, _wave_per_query_limit(safe_limit, len(batch))
+        )
+        more = _merge_wave_results(merged, safe_limit - len(tracks), seen)
+        tracks.extend(more)
+        seen.update(track["track_id"] for track in more)
+
+    if not tracks:
+        raise AudioServiceError(
+            f"Не удалось собрать волну для вайба {cleaned_vibe!r}"
+        )
+    random.shuffle(tracks)
+    return tracks
+
+
+async def get_wave_personalized(
+    favorites: list[dict[str, Any]] | None, limit: int = 15
+) -> list[dict[str, Any]]:
+    """Return a personalized wave built from the user's favorite tracks.
+
+    The likes are parsed once (:func:`_parse_favorite_item`): the real artist
+    is taken from the ``"Artist - Song"`` title split, a vibe is detected from
+    style keywords, and normalized song titles are collected for the hard
+    anti-duplicate filter. Candidates come, in order, from:
+
+    1. a randomized taste profile (top favorite artists, alternating wording);
+    2. Deezer discovery (:func:`_discover_similar_tracks_sync`): other songs
+       by the favorite artists plus tracks of related artists;
+    3. style queries for the detected vibe (e.g. slowed/phonk for aggressive
+       likes).
+
+    Only then, while the list is still short, it is topped up from the mood
+    pool matching the detected vibe — never from the generic trending pop
+    fallback when the user has likes. With no likes at all the wave mixes
+    every mood pool plus the trending fallback. A fully empty result is
+    ``[]`` so the API layer can fall back to the default chart gracefully.
+    """
+    try:
+        safe_limit = int(limit)
+    except (TypeError, ValueError):
+        safe_limit = 15
+    safe_limit = max(1, min(safe_limit, MAX_SEARCH_RESULTS))
+
+    parsed = [_parse_favorite_item(f) for f in (favorites or []) if isinstance(f, Mapping)]
+    artist_names = list(dict.fromkeys(p["artist"] for p in parsed if p["artist"]))[:5]
+    # Vibe of the wave = the majority vibe across all likes (not just the
+    # first one, which could carry no style keywords at all). Ties are broken
+    # towards the most specific vibe — "energetic" is the no-keyword default,
+    # so an explicit aggressive/sad/calm vote always wins it.
+    vibe_counts: dict[str, int] = {}
+    for parsed_item in parsed:
+        vibe_counts[parsed_item["vibe"]] = vibe_counts.get(parsed_item["vibe"], 0) + 1
+    if vibe_counts:
+        best_count = max(vibe_counts.values())
+        detected_vibe = next(
+            vibe
+            for vibe in ("aggressive", "sad", "calm", "energetic")
+            if vibe_counts.get(vibe, 0) == best_count
+        )
+    else:
+        detected_vibe = "energetic"
+    favorite_titles = {_normalize_song_title(x) for p in parsed for x in (p["title"],)}
+    favorite_titles.update(_normalize_song_title(f.get("title")) for f in (favorites or []) if isinstance(f, Mapping))
+    profile = build_taste_profile(favorites, max_artists=8, sample_size=5)
+
+    favorite_ids = {
+        str(favorite.get("track_id") or "").strip()
+        for favorite in (favorites or [])
+        if isinstance(favorite, Mapping) and favorite.get("track_id")
+    }
+    seen: set[str] = set(favorite_ids)
+    tracks: list[dict[str, Any]] = []
+    used_queries: set[str] = set()
+
+    async def gather_batch(queries: list[str]) -> None:
+        fresh = [query for query in queries if query not in used_queries]
+        used_queries.update(fresh)
+        if not fresh:
+            return
+        merged = await _wave_search_queries(
+            fresh, _wave_per_query_limit(safe_limit, len(fresh))
+        )
+        more = _merge_wave_results(merged, safe_limit - len(tracks), seen, favorite_titles)
+        tracks.extend(more)
+        seen.update(track["track_id"] for track in more)
+
+    # Round 1: taste-profile artists, extra wording for new songs by them and
+    # the style queries derived from the user's own likes.
+    artist_queries = [
+        query
+        for artist in artist_names[:3]
+        for query in (f"{artist} popular track", f"{artist} feat")
+    ]
+    style_queries = list(VIBE_STYLE_QUERIES.get(detected_vibe, ()))
+    await gather_batch(profile + artist_queries + style_queries)
+
+    # Round 2: Deezer — other songs by favorite artists + related artists.
+    if artist_names:
+        try:
+            discovered = await asyncio.wait_for(asyncio.to_thread(_discover_similar_tracks_sync, artist_names, favorite_titles, safe_limit), timeout=10)
+            merged = _merge_wave_results([discovered], safe_limit - len(tracks), seen, favorite_titles)
+            tracks.extend(merged)
+            seen.update(t["track_id"] for t in merged)
+        except (asyncio.TimeoutError, Exception):
+            logger.debug("Deezer personalized discovery failed", exc_info=True)
+
+    # Still short? Top up from the mood pool matching the user's likes only —
+    # the generic trending pop fallback is reserved for users with no likes.
+    if parsed:
+        topup_pool = list(WAVE_MOOD_QUERIES.get(detected_vibe, ()))
+    else:
+        topup_pool = [
+            query
+            for vibe_queries in WAVE_MOOD_QUERIES.values()
+            for query in vibe_queries
+        ]
+        topup_pool += list(TRENDING_FALLBACK_QUERIES)
+
+    rounds = 0
+    while len(tracks) < safe_limit and rounds < WAVE_TOPUP_MAX_ROUNDS:
+        rounds += 1
+        fresh_pool = [query for query in topup_pool if query not in used_queries]
+        if not fresh_pool:
+            break
+        batch = random.sample(
+            fresh_pool, min(WAVE_TOPUP_BATCH_SIZE, len(fresh_pool))
+        )
+        await gather_batch(batch)
+
+    random.shuffle(tracks)
+    return tracks
+
+
+def _discover_similar_tracks_sync(artists: list[str], favorite_titles: set[str], limit: int) -> list[dict[str, Any]]:
+    tracks: list[dict[str, Any]] = []
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            for artist in artists[:5]:
+                try:
+                    found = client.get("https://api.deezer.com/search/artist", params={"q": artist, "limit": 1}).json().get("data", [])
+                    if not found: continue
+                    aid = found[0]["id"]
+                    for endpoint, cap in ((f"artist/{aid}/top", 2), (f"artist/{aid}/related", 3)):
+                        data = client.get(f"https://api.deezer.com/{endpoint}", params={"limit": 10 if cap == 2 else 6}).json().get("data", [])
+                        if cap == 3:
+                            data = [tr for rel in data[:3] for tr in client.get(f"https://api.deezer.com/artist/{rel['id']}/top", params={"limit": 5}).json().get("data", [])]
+                        count = 0
+                        for item in data:
+                            title = str(item.get("title") or "")
+                            if title and _normalize_song_title(title) not in favorite_titles:
+                                tracks.append({"track_id": f"deezer:{item.get('id')}", "title": f"{item.get('artist', {}).get('name', artist)} - {title}", "artist": item.get("artist", {}).get("name", artist), "duration": item.get("duration", 180), "thumbnail": ""})
+                                count += 1
+                            if count >= cap: break
+                except Exception:
+                    logger.debug("Deezer lookup for %r failed", artist, exc_info=True)
+                    continue
+                if len(tracks) >= limit: break
+    except Exception:
+        logger.debug("Deezer discovery failed entirely", exc_info=True)
+        return []
+    return tracks
+
+
 # ---------------------------------------------------------------- stream URL
 
 

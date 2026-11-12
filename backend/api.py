@@ -6,7 +6,7 @@ import asyncio
 import logging
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, AsyncIterator, Callable
+from typing import Annotated, Any, AsyncIterator, Callable, Literal
 from urllib.parse import quote
 
 import httpx
@@ -24,6 +24,8 @@ from .audio_service import (
     close_stream_client,
     get_audio_stream_url,
     get_trending_tracks,
+    get_wave_by_mood,
+    get_wave_personalized,
     search_tracks,
     start_audio_stream,
 )
@@ -118,6 +120,24 @@ def _resolve_optional_user_id(
             return None
         return result.user_id
     return fallback_user_id
+
+
+def _soft_user_id(raw_user_id: str | None) -> int | None:
+    """Parse an explicit ``user_id`` query value without raising errors.
+
+    Unlike Pydantic's strict ``int`` parsing this accepts an absent, empty
+    or malformed value and just returns ``None``: a client that appends
+    ``user_id=`` in the wrong place (or double-appends after ``?limit=``)
+    must not crash the request with a 422.
+    """
+    text = str(raw_user_id or "").strip()
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def _favorite_track(payload: FavoriteCreate) -> dict[str, Any]:
@@ -269,9 +289,7 @@ def create_app(
         try:
             tracks = await search_tracks(cleaned_query, limit=limit)
         except AudioServiceError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        # Search succeeded (even with zero results): remember the query.
+            raise HTTPException(status_code=502, detail=str(exc)) from exc        # Search succeeded (even with zero results): remember the query.
         database: Database = request.app.state.db
         history_user_id = _resolve_optional_user_id(request, user_id)
         if history_user_id is not None:
@@ -290,6 +308,62 @@ def create_app(
     ) -> list[dict[str, Any]]:
         """Return the real trending list cached in backend memory."""
         return await get_trending_tracks(limit=limit)
+
+    # ------------------------------------------------------------ my wave
+
+    @app.get("/api/wave/mood", tags=["wave"])
+    async def wave_mood(
+        vibe: Annotated[
+            Literal["calm", "aggressive", "energetic", "sad"], Query()
+        ],
+        limit: Annotated[int, Query(ge=1, le=50)] = 15,
+    ) -> list[dict[str, Any]]:
+        """Return a 15-20 track wave matching the requested vibe.
+
+        The vibe drives several parallel YouTube queries inside the audio
+        service; everything is filtered like regular search results, so the
+        Mini App can render the list with the standard track cards.
+        """
+        try:
+            return await get_wave_by_mood(vibe, limit=limit)
+        except AudioServiceError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/api/wave/personalized", tags=["wave"])
+    async def wave_personalized(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=50)] = 15,
+        user_id: Annotated[str | None, Query(max_length=32)] = None,
+    ) -> list[dict[str, Any]]:
+        """Return the personalized wave built from the user's favorites.
+
+        Same ownership rules as the favorites endpoints: the signed initData
+        user in production, the explicit ``user_id`` fallback in dev. The
+        ``user_id`` parameter is deliberately soft (parsed by
+        :func:`_soft_user_id` instead of Pydantic): an absent, empty or
+        malformed value never fails the request — the wave is simply built
+        without a taste profile (favorites ``[]``) and the fallback chart
+        covers it. With no favorites the default trending chart is served
+        instead, so the wave is never empty.
+        """
+        database: Database = request.app.state.db
+        fallback_user_id = _soft_user_id(user_id)
+        resolved_user_id = _resolve_optional_user_id(request, fallback_user_id)
+
+        favorites: list[dict[str, Any]] = []
+        if resolved_user_id is not None:
+            favorites = await database.list_favorites(resolved_user_id)
+        try:
+            tracks = await get_wave_personalized(favorites, limit=limit)
+        except AudioServiceError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        if not tracks:
+            # Graceful fallback: a fresh user (or an all-artists-less
+            # profile) still gets a playable wave — the "Популярное" chart.
+            tracks = await get_trending_tracks(limit=limit)
+        return tracks
+
     @app.get("/api/stream/{track_id}", tags=["music"])
     async def stream(track_id: str, request: Request) -> StreamingResponse:
         """Resolve the direct audio URL and proxy it with Range support.
