@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import re
+import socket
+import tempfile
 import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -33,9 +37,6 @@ MAX_TRACK_SECONDS = 900
 SEARCH_POOL_SIZE = 30
 CHUNK_SIZE = 64 * 1024
 
-# Hard ceilings for blocking yt-dlp/httpx work: without them a single wedged
-# upstream call would hold a worker thread (and, for trending, the vendored
-# request path) forever while clients time out through the tunnel.
 SEARCH_TIMEOUT_SECONDS = 30.0
 STREAM_RESOLVE_TIMEOUT_SECONDS = 20.0
 
@@ -43,23 +44,13 @@ TRENDING_RESOLVE_POOL_SIZE = 8
 TRENDING_MIN_TRACK_SECONDS = 90
 TRENDING_MAX_TRACK_SECONDS = 330
 TRENDING_CACHE_TTL_SECONDS = 30 * 60
-# Candidate/rotation tuning: the chart pool is wide (so every 30-minute
-# cycle can pick a different 20), but only one small batch is actually
-# resolved through yt-dlp per cycle.
 TRENDING_ROTATE_INTERVAL_SECONDS = 30 * 60
 TRENDING_CANDIDATE_POOL_SIZE = 60
 TRENDING_RESOLVE_BATCH_SIZE = 25
-# Timeouts for the three stages of a cache refresh (chart fetch, per-song
-# resolution, fallback search). The refresh runs in the background, so these
-# bound how long a wedged refresh can occupy the single-flight slot.
 TRENDING_CHART_TIMEOUT_SECONDS = 20.0
-TRENDING_RESOLVE_TIMEOUT_SECONDS = 30.0
-TRENDING_FALLBACK_TIMEOUT_SECONDS = 45.0
-# A cold (empty) cache must produce at least some answer before the tunnel
-# cuts the request; afterwards the refresh keeps running in the background.
+TRENDING_RESOLVE_TIMEOUT_SECONDS = 15.0
+TRENDING_FALLBACK_TIMEOUT_SECONDS = 35.0
 TRENDING_COLD_WAIT_SECONDS = 15.0
-# When a refresh finished with no tracks, do not re-run the whole network
-# chain on every request for a short cooldown period.
 TRENDING_EMPTY_RETRY_COOLDOWN_SECONDS = 60.0
 
 TRENDING_CACHE_LOCK = asyncio.Lock()
@@ -68,12 +59,8 @@ TRENDING_CACHE: dict[str, Any] = {
     "updated_at": 0.0,
     "empty_at": 0.0,
 }
-# Single-flight slot: at most one background refresh exists at a time. The
-# variable is read/written under TRENDING_CACHE_LOCK only.
 TRENDING_REFRESH_TASK: asyncio.Task[list[dict[str, Any]]] | None = None
-# Hard stop-list of title words: chart cutbacks ("Billboard Hot 100 Top 20
-# November 2026"), mixes, compilations, talk shows, reviews and podcasts never
-# pass as single songs (Russian words block "Что не так с Яндекс Музыкой" etc.).
+
 TITLE_EXCLUDE_RE = re.compile(
     r"\b(?:"
     r"billboard|top\s*100|top\s*50|top\s*20|top\s*10|charts?|countdown|"
@@ -84,15 +71,13 @@ TITLE_EXCLUDE_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-# Real Russian hits chart served by the public Yandex Music feed.
-YANDEX_CHART_URL = "https://music.yandex.ru/handlers/chart.jsx?what=chart&lang=ru"
-# Fast backup source: top Russian playlists on Deezer.
+
+# Public Deezer Russian playlists (Yandex old .jsx handler now redirects to HTML)
 DEEZER_PLAYLIST_SEARCH_URLS = (
     "https://api.deezer.com/search/playlist?q=Топ Россия 2026",
     "https://api.deezer.com/search/playlist?q=Русские хиты",
 )
-# Stage 2 fallback: one specific hit per query, all different artists, so the
-# list never degenerates into several songs by the same performer.
+
 TRENDING_FALLBACK_QUERIES = (
     "Баста Моя Мишель - Зима в сердце official audio",
     "MACAN - ASPHALT 8 official audio",
@@ -139,27 +124,165 @@ BROWSER_USER_AGENT = (
 )
 STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
 
-# The streaming proxy reuses one client across requests: creating a fresh
-# client per stream would redo the TCP+TLS handshake against the CDN on
-# every play/seek request.
 _stream_client: httpx.AsyncClient | None = None
 _stream_client_lock = asyncio.Lock()
+_detected_proxy_cache: str | None = None
+_detected_proxy_checkedAt: float = 0.0
+
+
+def _is_local_port_open(host: str, port: int) -> bool:
+    """Check if a local proxy port (e.g. Xray/v2ray 10809/10808) is listening."""
+    try:
+        with socket.create_connection((host, port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _detect_proxy_url() -> str:
+    """Detect explicit proxy from env or auto-detect local Xray SOCKS5 inbound."""
+    global _detected_proxy_cache, _detected_proxy_checkedAt
+
+    explicit = (
+        os.environ.get("YTDLP_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("ALL_PROXY")
+        or ""
+    ).strip()
+    if explicit.lower() in {"none", "off", "direct", "false", "0"}:
+        return ""
+    if explicit:
+        return explicit
+
+    now = time.monotonic()
+    if _detected_proxy_cache is not None and (now - _detected_proxy_checkedAt) < 30.0:
+        return _detected_proxy_cache
+
+    _detected_proxy_checkedAt = now
+    # 10808 (SOCKS5) is first: verified working with YouTube over Xray
+    for host, port, scheme in (
+        ("127.0.0.1", 10808, "socks5h"),
+        ("127.0.0.1", 1080, "socks5h"),
+        ("127.0.0.1", 10809, "http"),
+        ("127.0.0.1", 2080, "http"),
+    ):
+        if _is_local_port_open(host, port):
+            proxy_url = f"{scheme}://{host}:{port}"
+            if _detected_proxy_cache != proxy_url:
+                logger.info(
+                    "Автоматически подключен локальный прокси для YouTube: %s",
+                    proxy_url,
+                )
+            _detected_proxy_cache = proxy_url
+            return proxy_url
+
+    _detected_proxy_cache = ""
+    return ""
 
 
 async def _get_stream_client() -> httpx.AsyncClient:
-    """Return the shared asynchronous httpx client for upstream streams.
-
-    The client is created lazily (once per process) and lives until
-    :func:`close_stream_client` is called from the app lifespan.
-    """
+    """Return the shared asynchronous httpx client for upstream streams."""
     global _stream_client
     async with _stream_client_lock:
         if _stream_client is None or _stream_client.is_closed:
-            _stream_client = httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=STREAM_TIMEOUT,
-            )
+            proxy = _detect_proxy_url()
+            # Convert socks5h:// -> socks5:// for httpx/socksio compatibility
+            httpx_proxy: str | None = None
+            if proxy:
+                httpx_proxy = (
+                    proxy.replace("socks5h://", "socks5://", 1)
+                    if proxy.startswith("socks5h://")
+                    else proxy
+                )
+            try:
+                _stream_client = httpx.AsyncClient(
+                    follow_redirects=True,
+                    timeout=STREAM_TIMEOUT,
+                    proxy=httpx_proxy,
+                )
+            except ImportError:
+                logger.warning(
+                    "Пакет socksio не установлен (pip install socksio); "
+                    "аудиопоток httpx идёт напрямую без прокси"
+                )
+                _stream_client = httpx.AsyncClient(
+                    follow_redirects=True,
+                    timeout=STREAM_TIMEOUT,
+                )
         return _stream_client
+
+
+def _yt_dlp_base_params() -> dict[str, Any]:
+    """Return base yt-dlp options with fast socket timeout and auto-detected proxy."""
+    params: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "socket_timeout": 15,
+        "retries": 3,
+        "extractor_retries": 2,
+    }
+    proxy = _detect_proxy_url()
+    if proxy:
+        params["proxy"] = proxy
+    return params
+
+
+_TRANSPORT_ERROR_MARKERS = (
+    "timed out",
+    "timeout",
+    "tls handshake",
+    "unexpected tls packet",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "network is unreachable",
+    "unable to download",
+    "temporary failure in name resolution",
+    "getaddrinfo failed",
+)
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    """Heuristic: does this yt-dlp exception look like a network/TLS failure?"""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _TRANSPORT_ERROR_MARKERS)
+
+
+def _ydl_extract_info(
+    url: str, params: dict[str, Any]
+) -> Mapping[str, Any] | None:
+    """Run ``extract_info`` with one extra retry on transport errors.
+
+    A single TLS handshake timeout to YouTube must not break a search: on
+    retry the proxy is re-detected (its 30 s cache may be stale), so the
+    second attempt goes through whichever local/explicit proxy is alive now.
+    """
+    global _detected_proxy_cache, _detected_proxy_checkedAt
+
+    attempts = 2
+    last_exc: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with yt_dlp.YoutubeDL(params) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts or not _is_transport_error(exc):
+                break
+            logger.warning(
+                "yt-dlp network failure for %r (попытка %d), повторяю: %s",
+                url,
+                attempt,
+                exc,
+            )
+            _detected_proxy_cache = None
+            refreshed = _detect_proxy_url()
+            if refreshed and refreshed != params.get("proxy"):
+                params = {**params, "proxy": refreshed}
+    raise last_exc  # type: ignore[misc]
 
 
 async def close_stream_client() -> None:
@@ -213,7 +336,6 @@ def _best_thumbnail(entry: Mapping[str, Any]) -> str:
 
     thumbnails = entry.get("thumbnails")
     if isinstance(thumbnails, list):
-        # yt-dlp usually orders thumbnails from smallest to largest.
         for thumbnail in reversed(thumbnails):
             if not isinstance(thumbnail, Mapping):
                 continue
@@ -261,82 +383,144 @@ def _is_music_track(entry: Mapping[str, Any]) -> bool:
     return MIN_TRACK_SECONDS <= duration <= MAX_TRACK_SECONDS
 
 
-def _search_tracks_sync(query: str, limit: int) -> list[dict[str, Any]]:
-    params = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "skip_download": True,
-        "noplaylist": True,
-    }
-
-    search_query = _refine_search_query(query)
-    # Ask for extra results: live streams, Shorts and mixes are filtered out
-    # in Python, so a smaller pool may not yield the requested number of tracks.
-    pool_size = min(MAX_SEARCH_RESULTS, max(SEARCH_POOL_SIZE, limit * 2))
-
+def _deezer_search_tracks_sync(query: str, limit: int) -> list[dict[str, Any]]:
+    """Fallback track search via public Deezer API when YouTube is unreachable."""
+    cleaned = re.sub(r"(?i)\bofficial\s+audio\b|\baudio\b", "", query).strip()
+    if not cleaned:
+        cleaned = query.strip()
     try:
-        with yt_dlp.YoutubeDL(params) as ydl:
-            info = ydl.extract_info(
-                f"ytsearch{pool_size}:{search_query}", download=False
+        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
+            resp = client.get(
+                "https://api.deezer.com/search",
+                params={"q": cleaned, "limit": max(limit * 2, 20)},
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": BROWSER_USER_AGENT,
+                },
             )
-    except Exception as exc:  # yt-dlp raises different exception types
-        raise AudioServiceError(f"Не удалось выполнить поиск: {query!r}") from exc
-
-    if not info:
+            resp.raise_for_status()
+            data = resp.json().get("data") or []
+    except Exception:
+        logger.debug("Deezer fallback search failed: %r", cleaned, exc_info=True)
         return []
 
-    entries = info.get("entries") or []
     results: list[dict[str, Any]] = []
-    skipped = 0
-
-    for entry in entries:
-        if not isinstance(entry, Mapping):
+    for item in data:
+        if not isinstance(item, Mapping):
             continue
-        if not _is_music_track(entry):
-            skipped += 1
+        deezer_id = item.get("id")
+        title = str(item.get("title") or "").strip()
+        if not deezer_id or not title or TITLE_EXCLUDE_RE.search(title):
             continue
-
-        track_id = str(entry.get("id") or "").strip()
-        if not track_id:
-            skipped += 1
-            continue
-
+        artist_obj = item.get("artist")
+        artist = (
+            str(artist_obj.get("name") or "").strip()
+            if isinstance(artist_obj, Mapping)
+            else ""
+        )
+        album_obj = item.get("album")
+        thumbnail = ""
+        if isinstance(album_obj, Mapping):
+            thumbnail = str(
+                album_obj.get("cover_big")
+                or album_obj.get("cover_medium")
+                or album_obj.get("cover")
+                or ""
+            ).strip()
+        duration = _coerce_duration(item.get("duration")) or 180
         results.append(
             {
-                "track_id": track_id,
-                "title": str(entry.get("title") or "Unknown title").strip(),
-                "artist": str(
-                    entry.get("uploader")
-                    or entry.get("channel")
-                    or entry.get("artist")
-                    or ""
-                ).strip(),
-                "duration": _coerce_duration(entry.get("duration")),
-                "thumbnail": _best_thumbnail(entry),
+                "track_id": f"deezer:{deezer_id}",
+                "title": title,
+                "artist": artist,
+                "duration": duration,
+                "thumbnail": thumbnail,
             }
         )
         if len(results) >= limit:
             break
-
-
-    logger.debug(
-        "Search %r -> %r: kept %d, skipped %d of %d",
-        query,
-        search_query,
-        len(results),
-        skipped,
-        len(entries),
-    )
     return results
 
 
-async def search_tracks(query: str, limit: int = 15) -> list[dict[str, Any]]:
-    """Search for tracks and return normalized metadata.
+def _search_tracks_sync(query: str, limit: int) -> list[dict[str, Any]]:
+    params = {
+        **_yt_dlp_base_params(),
+        "extract_flat": True,
+    }
 
-    yt-dlp is blocking, so it runs in a worker thread and never blocks the
-    FastAPI event loop.
-    """
+    search_query = _refine_search_query(query)
+    pool_size = min(MAX_SEARCH_RESULTS, max(SEARCH_POOL_SIZE, limit * 2))
+
+    info: Mapping[str, Any] | None = None
+    yt_error: Exception | None = None
+    try:
+        info = _ydl_extract_info(
+            f"ytsearch{pool_size}:{search_query}", params
+        )
+    except Exception as exc:
+        yt_error = exc
+        logger.debug("yt-dlp search failed for %r, trying Deezer fallback", query)
+
+    results: list[dict[str, Any]] = []
+    skipped = 0
+
+    if info:
+        entries = info.get("entries") or []
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            if not _is_music_track(entry):
+                skipped += 1
+                continue
+
+            track_id = str(entry.get("id") or "").strip()
+            if not track_id:
+                skipped += 1
+                continue
+
+            results.append(
+                {
+                    "track_id": track_id,
+                    "title": str(entry.get("title") or "Unknown title").strip(),
+                    "artist": str(
+                        entry.get("uploader")
+                        or entry.get("channel")
+                        or entry.get("artist")
+                        or ""
+                    ).strip(),
+                    "duration": _coerce_duration(entry.get("duration")),
+                    "thumbnail": _best_thumbnail(entry),
+                }
+            )
+            if len(results) >= limit:
+                break
+
+        logger.debug(
+            "Search %r -> %r: kept %d, skipped %d of %d",
+            query,
+            search_query,
+            len(results),
+            skipped,
+            len(entries),
+        )
+
+    if results:
+        return results
+
+    deezer_results = _deezer_search_tracks_sync(query, limit)
+    if deezer_results:
+        return deezer_results
+
+    if yt_error is not None:
+        raise AudioServiceError(
+            f"Не удалось выполнить поиск: {query!r}"
+        ) from yt_error
+
+    return []
+
+
+async def search_tracks(query: str, limit: int = 15) -> list[dict[str, Any]]:
+    """Search for tracks and return normalized metadata."""
     cleaned_query = " ".join(str(query or "").split())
     if not cleaned_query:
         return []
@@ -347,7 +531,7 @@ async def search_tracks(query: str, limit: int = 15) -> list[dict[str, Any]]:
         safe_limit = 15
     safe_limit = max(1, min(safe_limit, MAX_SEARCH_RESULTS))
 
-    logger.debug("Searching yt-dlp: query=%r limit=%d", cleaned_query, safe_limit)
+    logger.debug("Searching tracks: query=%r limit=%d", cleaned_query, safe_limit)
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(_search_tracks_sync, cleaned_query, safe_limit),
@@ -421,61 +605,26 @@ def _chart_track_from_entry(item: Mapping[str, Any], entry: Mapping[str, Any]):
             or ""
         ).strip(),
         "duration": _coerce_duration(entry.get("duration")),
-        "thumbnail": _best_thumbnail(entry),
+        "thumbnail": _best_thumbnail(entry) or str(item.get("thumbnail") or ""),
     }
 
 
-def _fetch_yandex_chart_sync(limit: int) -> list[dict[str, str]]:
-    """Return the real Russian hits chart from the public Yandex Music feed."""
-    if limit <= 0:
-        return []
-
-    try:
-        with httpx.Client(timeout=STREAM_TIMEOUT) as client:
-            response = client.get(
-                YANDEX_CHART_URL,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": BROWSER_USER_AGENT,
-                    "Referer": "https://music.yandex.ru/",
-                },
-            )
-            response.raise_for_status()
-            payload = response.json()
-    except Exception:
-        logger.debug("Yandex chart failed: %s", YANDEX_CHART_URL, exc_info=True)
-        return []
-
-    entries: Any = None
-    if isinstance(payload, Mapping):
-        chart = payload.get("chart")
-        if isinstance(chart, Mapping):
-            entries = chart.get("tracks")
-        if not isinstance(entries, list):
-            entries = payload.get("tracks")
-    if not isinstance(entries, list):
-        return []
-
-    items: list[dict[str, str]] = []
-    for entry in entries:
-        if not isinstance(entry, Mapping):
-            continue
-        track = entry.get("track")
-        track = track if isinstance(track, Mapping) else entry
-        title = str(track.get("title") or track.get("name") or "").strip()
-        artists = track.get("artists")
-        artist_name = ""
-        if isinstance(artists, list):
-            for artist in artists:
-                if isinstance(artist, Mapping) and artist.get("name"):
-                    artist_name = str(artist["name"]).strip()
-                    break
-        if not artist_name or not title:
-            continue
-        items.append({"artist": artist_name, "title": title})
-        if len(items) >= limit:
-            break
-    return items
+def _chart_item_to_deezer_track(item: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Convert a chart item with Deezer metadata directly into a playable track."""
+    deezer_id = str(item.get("deezer_id") or "").strip()
+    title = str(item.get("title") or "").strip()
+    artist = str(item.get("artist") or "").strip()
+    if not deezer_id or not title or not artist:
+        return None
+    if TITLE_EXCLUDE_RE.search(title):
+        return None
+    return {
+        "track_id": f"deezer:{deezer_id}",
+        "title": title,
+        "artist": artist,
+        "duration": _coerce_duration(item.get("duration")) or 180,
+        "thumbnail": str(item.get("thumbnail") or "").strip(),
+    }
 
 
 def _fetch_deezer_ru_playlist_sync(limit: int) -> list[dict[str, str]]:
@@ -484,7 +633,7 @@ def _fetch_deezer_ru_playlist_sync(limit: int) -> list[dict[str, str]]:
         return []
 
     try:
-        with httpx.Client(timeout=STREAM_TIMEOUT) as client:
+        with httpx.Client(timeout=STREAM_TIMEOUT, follow_redirects=True) as client:
             playlist_id: int | None = None
             headers = {
                 "Accept": "application/json",
@@ -550,36 +699,48 @@ def _fetch_deezer_ru_playlist_sync(limit: int) -> list[dict[str, str]]:
         title_name = str(track.get("title") or "").strip()
         if not artist_name or not title_name:
             continue
-        # Keep only tracks that clearly belong to the Russian chart.
         if not _has_cyrillic(title_name) and not _has_cyrillic(artist_name):
             continue
-        items.append({"artist": artist_name, "title": title_name})
+
+        album = track.get("album")
+        cover = ""
+        if isinstance(album, Mapping):
+            cover = str(
+                album.get("cover_big")
+                or album.get("cover_medium")
+                or album.get("cover")
+                or ""
+            ).strip()
+
+        items.append(
+            {
+                "artist": artist_name,
+                "title": title_name,
+                "deezer_id": str(track.get("id") or "").strip(),
+                "duration": str(_coerce_duration(track.get("duration")) or 180),
+                "thumbnail": cover,
+            }
+        )
         if len(items) >= limit:
             break
     return items
 
 
 def _get_chart_items_sync(limit: int) -> list[dict[str, str]]:
-    """Real single songs, stage 1: Yandex RU chart first, Deezer RU playlist as fallback."""
-    items = _fetch_yandex_chart_sync(limit)
-    remaining = limit - len(items)
-    if remaining <= 0:
-        return items[:limit]
+    """Fetch chart items from Deezer RU playlists."""
+    items: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
 
-    seen: set[tuple[str, str]] = {
-        (item["artist"].lower(), item["title"].lower()) for item in items
-    }
-    for raw_item in _fetch_deezer_ru_playlist_sync(remaining):
+    for raw_item in _fetch_deezer_ru_playlist_sync(limit):
         title = str(raw_item.get("title") or "").strip()
         artist = str(raw_item.get("artist") or "").strip()
         if not title or not artist:
             continue
-        # Yandex and the Deezer playlist can host the same song.
         key = (artist.lower(), title.lower())
         if key in seen:
             continue
         seen.add(key)
-        items.append({"artist": artist, "title": title})
+        items.append(raw_item)
         if len(items) >= limit:
             break
     return items[:limit]
@@ -588,19 +749,13 @@ def _get_chart_items_sync(limit: int) -> list[dict[str, str]]:
 def _yt_search_entries_sync(query: str, pool: int) -> list[Mapping[str, Any]]:
     """Run one flat yt-dlp search and return the raw entries list."""
     params = {
-        "quiet": True,
-        "no_warnings": True,
+        **_yt_dlp_base_params(),
         "extract_flat": True,
-        "skip_download": True,
-        "noplaylist": True,
     }
 
     try:
-        with yt_dlp.YoutubeDL(params) as ydl:
-            info = ydl.extract_info(
-                f"ytsearch{pool}:{query}", download=False
-            )
-    except Exception as exc:  # yt-dlp raises different exception types
+        info = _ydl_extract_info(f"ytsearch{pool}:{query}", params)
+    except Exception as exc:
         logger.debug("Trending search failed: %r", query, exc_info=True)
         raise AudioServiceError(
             f"Не удалось получить тренды: {query!r}"
@@ -616,19 +771,30 @@ def _yt_search_entries_sync(query: str, pool: int) -> list[Mapping[str, Any]]:
 def _resolve_chart_track_sync(
     item: Mapping[str, str], query: str
 ) -> dict[str, Any] | None:
-    """One yt-search for a chart song -> track with a real YouTube id."""
-    entries = _yt_search_entries_sync(query, 1)
-    for entry in entries:
-        candidate = _chart_track_from_entry(item, entry)
-        if candidate:
-            return candidate
-    return None
+    """One yt-search for a chart song -> track with a real YouTube id or Deezer fallback."""
+    try:
+        entries = _yt_search_entries_sync(query, 1)
+        for entry in entries:
+            candidate = _chart_track_from_entry(item, entry)
+            if candidate:
+                return candidate
+    except AudioServiceError:
+        pass
+
+    deezer_candidate = _chart_item_to_deezer_track(item)
+    if deezer_candidate:
+        return deezer_candidate
+
+    fallback = _deezer_search_tracks_sync(
+        f"{item.get('artist', '')} {item.get('title', '')}", 1
+    )
+    return fallback[0] if fallback else None
 
 
 async def _resolve_chart_items(
     chart_items: list[dict[str, str]], limit: int
 ) -> list[dict[str, Any]]:
-    """Resolve chart songs into playable YouTube ids, 8 lookups in parallel."""
+    """Resolve chart songs into playable YouTube/Deezer ids, 8 lookups in parallel."""
     semaphore = asyncio.Semaphore(TRENDING_RESOLVE_POOL_SIZE)
 
     async def resolve(item: Mapping[str, str]):
@@ -643,14 +809,14 @@ async def _resolve_chart_items(
                 logger.debug(
                     "Trending resolve timed out: %r", item.get("title")
                 )
-                return None
+                return _chart_item_to_deezer_track(item)
             except AudioServiceError:
-                return None
+                return _chart_item_to_deezer_track(item)
             except Exception:
                 logger.exception(
                     "Unexpected trending search failure: %r", item.get("title")
                 )
-                return None
+                return _chart_item_to_deezer_track(item)
 
     candidates = await asyncio.gather(*(resolve(item) for item in chart_items))
 
@@ -663,7 +829,6 @@ async def _resolve_chart_items(
         track_id = candidate["track_id"]
         if not track_id or track_id in seen:
             continue
-        # Diversity cap: at most 2 songs from the same artist in the list.
         artist_key = str(candidate.get("artist") or "").strip().lower()
         if artist_key and artist_counts.get(artist_key, 0) >= 2:
             continue
@@ -677,12 +842,7 @@ async def _resolve_chart_items(
 
 
 def _get_trending_from_search_sync(limit: int) -> list[dict[str, Any]]:
-    """Stage 2: one specific RU hit per query so the list stays varied.
-
-    The wide query pool is rotated by the 30-minute cycle counter, so every
-    refresh starts at a fresh offset and picks a different set of hits
-    instead of always the first `limit` queries in the tuple.
-    """
+    """Stage 2: one specific RU hit per query so the list stays varied."""
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
     artist_counts: dict[str, int] = {}
@@ -696,9 +856,22 @@ def _get_trending_from_search_sync(limit: int) -> list[dict[str, Any]]:
         if len(results) >= limit:
             break
         try:
-            # A tiny pool is enough: each query is one well-known song.
             entries = _yt_search_entries_sync(query, 2)
         except AudioServiceError:
+            deezer_hits = _deezer_search_tracks_sync(query, 1)
+            for track in deezer_hits:
+                track_id = track["track_id"]
+                if not track_id or track_id in seen:
+                    continue
+                artist_key = str(track.get("artist") or "").strip().lower()
+                if artist_key and artist_counts.get(artist_key, 0) >= 2:
+                    continue
+                if artist_key:
+                    artist_counts[artist_key] = (
+                        artist_counts.get(artist_key, 0) + 1
+                    )
+                seen.add(track_id)
+                results.append(track)
             continue
         except Exception:
             logger.exception("Unexpected trending search failure: %r", query)
@@ -711,7 +884,6 @@ def _get_trending_from_search_sync(limit: int) -> list[dict[str, Any]]:
             track_id = track["track_id"]
             if not track_id or track_id in seen:
                 continue
-            # Diversity cap: at most 2 songs from the same artist.
             artist_key = str(track.get("artist") or "").strip().lower()
             if artist_key and artist_counts.get(artist_key, 0) >= 2:
                 continue
@@ -742,20 +914,10 @@ def _merge_by_track_id(
 
 
 async def _refresh_trending_cache(limit: int) -> list[dict[str, Any]]:
-    """Fetch and resolve a fresh trending list WITHOUT holding the cache lock.
-
-    This is the single-flight refresh body. It never blocks other requests on
-    the lock while doing network work; the cache state is updated under the
-    lock only after a successful fetch. On failure (or an empty result) the
-    previous cache is left untouched and a short "empty" cooldown is recorded
-    so that requests stop re-running the whole network chain.
-    """
+    """Fetch and resolve a fresh trending list WITHOUT holding the cache lock."""
     tracks: list[dict[str, Any]] = []
+    chart_items: list[dict[str, str]] = []
     try:
-        # Stage 1: gather a wide candidate pool (up to ~60 chart entries) so
-        # every 30-minute cycle can pick a different slice of chart hits.
-        # Randomly subsample the batch BEFORE any yt-dlp work: resolving all
-        # 60 candidates would waste resources for the same 20 final tracks.
         chart_items = await asyncio.wait_for(
             asyncio.to_thread(
                 _get_chart_items_sync,
@@ -768,8 +930,6 @@ async def _refresh_trending_cache(limit: int) -> list[dict[str, Any]]:
                 chart_items, TRENDING_RESOLVE_BATCH_SIZE
             )
         elif chart_items:
-            # A short pool still gets shuffled: each cycle serves the same
-            # hits in a fresh order.
             random.shuffle(chart_items)
         tracks = await _resolve_chart_items(chart_items, limit)
         if len(tracks) < limit:
@@ -781,9 +941,17 @@ async def _refresh_trending_cache(limit: int) -> list[dict[str, Any]]:
     except asyncio.CancelledError:
         raise
     except asyncio.TimeoutError:
-        logger.warning("Trending refresh timed out")
+        logger.warning("Trending refresh timed out; using chart fallback if available")
     except Exception:
         logger.exception("Trending fetch failed")
+
+    if not tracks and chart_items:
+        for item in chart_items:
+            candidate = _chart_item_to_deezer_track(item)
+            if candidate:
+                tracks.append(candidate)
+            if len(tracks) >= limit:
+                break
 
     if not tracks:
         logger.warning("Trending sources did not return any tracks")
@@ -809,12 +977,7 @@ def _start_trending_refresh_locked(limit: int) -> asyncio.Task[list[dict[str, An
 
 
 def _rotate_cached_tracks(tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Deterministically shuffle the cached pool per 30-minute cycle.
-
-    Uses the cycle counter as the seed, so every request inside the same
-    half-hour serves the same order, and the order itself differs each
-    cycle even before the background refresh replaces the track set.
-    """
+    """Deterministically shuffle the cached pool per 30-minute cycle."""
     if len(tracks) < 2:
         return list(tracks)
     bucket = int(time.time() // TRENDING_ROTATE_INTERVAL_SECONDS)
@@ -824,18 +987,7 @@ def _rotate_cached_tracks(tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 async def get_trending_tracks(limit: int = 20) -> list[dict[str, Any]]:
-    """Return the trending list using stale-while-revalidate.
-
-    Semantics:
-
-    * fresh cache -> served immediately, no network work;
-    * stale cache -> served immediately while one background task refreshes
-      it (single-flight: concurrent callers never trigger duplicate
-      refreshes, and slow refreshes no longer block this request);
-    * cold cache  -> waits a bounded time for the in-flight refresh, then
-      gives up without holding anything so the request cannot hit the
-      tunnel timeout; the refresh keeps running and fills the cache.
-    """
+    """Return the trending list using stale-while-revalidate."""
     try:
         safe_limit = int(limit)
     except (TypeError, ValueError):
@@ -850,12 +1002,10 @@ async def get_trending_tracks(limit: int = 20) -> list[dict[str, Any]]:
 
         task = TRENDING_REFRESH_TASK
         if task is not None and task.done():
-            # Reap the finished refresh; its result is already in the cache.
             task = None
 
         if task is None:
             empty_age = time.monotonic() - TRENDING_CACHE["empty_at"]
-            # The previous refresh returned nothing: throttle retries per cooldown.
             recently_empty = (
                 TRENDING_CACHE["empty_at"] > 0
                 and empty_age < TRENDING_EMPTY_RETRY_COOLDOWN_SECONDS
@@ -863,25 +1013,18 @@ async def get_trending_tracks(limit: int = 20) -> list[dict[str, Any]]:
             if cached and cache_age <= TRENDING_CACHE_TTL_SECONDS:
                 return _rotate_cached_tracks(cached)[:safe_limit]
             if recently_empty:
-                # No data and the last refresh just failed: honor the cooldown
-                # instead of hammering the upstream sources every request.
                 return _rotate_cached_tracks(cached)[:safe_limit]
             task = _start_trending_refresh_locked(safe_limit)
 
-        # Stale-while-revalidate: keep serving the previous list even when it
-        # is older than the TTL, so the frontend never blocks on the refresh.
         if cached:
             return _rotate_cached_tracks(cached)[:safe_limit]
 
-    # Cold start with an empty cache: wait a bounded time for the refresh.
-    # asyncio.shield keeps the background task alive on timeout/cancellation.
     try:
         tracks = await asyncio.wait_for(
             asyncio.shield(task), timeout=TRENDING_COLD_WAIT_SECONDS
         )
     except asyncio.CancelledError:
         if task.cancelled():
-            # The refresh itself was cancelled (e.g. shutdown), not us.
             return cached[:safe_limit]
         raise
     except asyncio.TimeoutError:
@@ -900,26 +1043,11 @@ async def get_trending_tracks(limit: int = 20) -> list[dict[str, Any]]:
 
 # ---------------------------------------------------------------------- wave
 
-# The "Моя волна" (My Wave) feature: vibe-driven search and a personalized
-# wave built from the user's favorites. Wave-specific duration window keeps
-# DJ compilations and hour mixes out even when a single title slips past the
-# word filter; the personal list also never repeats tracks the user liked.
 WAVE_MIN_TRACK_SECONDS = 60
 WAVE_MAX_TRACK_SECONDS = 480
-# Diversity cap shared with trending: at most 2 tracks per artist.
 WAVE_MAX_TRACKS_PER_ARTIST = 2
-# Whole-wave budget: every mood fires `len(queries)` parallel yt-dlp searches
-# and each one already enforces SEARCH_TIMEOUT_SECONDS internally.
 WAVE_SEARCH_TIMEOUT_SECONDS = 45.0
 
-# Vibe -> YouTube search queries. The wording matters: a query term such as
-# "mix" would surface mixes/compilations whose titles are then wiped out by
-# TITLE_EXCLUDE_RE, ending with (near) empty pools. Instead of a handful of
-# generic phrases (which YouTube answers with hour-long mixes that get
-# filtered out) each vibe carries a wide pool of point queries — concrete
-# artists and single-track searches, so yt-dlp finds real 2–5 minute songs.
-# ``get_wave_by_mood`` only takes a random 6–7 query sample per run and
-# refills from the rest, so every wave is fresh and never static.
 WAVE_MOOD_QUERIES: dict[str, tuple[str, ...]] = {
     "calm": (
         "Øneheart snowfall",
@@ -1048,10 +1176,6 @@ WAVE_MOOD_QUERIES: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Style/genre wording derived from what the user actually liked (slowed,
-# reverb, phonk, lofi, post-punk...). These queries are added to the
-# personalized wave's first candidate batch so the wave follows the user's
-# vibe even when the artist searches come up short.
 VIBE_STYLE_QUERIES: dict[str, tuple[str, ...]] = {
     "aggressive": (
         "best slowed reverb phonk track",
@@ -1072,14 +1196,8 @@ VIBE_STYLE_QUERIES: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Query suffixes alternating in the personalized wave: taste-profile artists
-# are searched once each with a rotating wording so the same artist is not
-# locked into one result pattern.
 TASTE_QUERY_SUFFIXES = ("official audio", "track", "популярные треки")
 
-# Per-run sample sizes: each wave call takes a random handful of queries from
-# the vibe pool (and the taste pool tops up from the trending/mood pools), so
-# consecutive runs produce different, non-repeating track lists.
 WAVE_QUERY_BATCH_SIZE = 7
 WAVE_TOPUP_BATCH_SIZE = 6
 WAVE_TOPUP_MAX_ROUNDS = 8
@@ -1087,7 +1205,11 @@ WAVE_TOPUP_MAX_ROUNDS = 8
 
 def _clean_favorite_text(value: Any) -> str:
     text = re.sub(r"[\u200b-\u200f\uFEFF]", "", str(value or ""))
-    text = re.sub(r"(?i)\s*-\s*Topic\b|\bVEVO\b|\bOfficial\s+(?:Audio|Video|Music\s+Video)\b|\bLyrics?\b|\bLyric\s+Video\b", "", text)
+    text = re.sub(
+        r"(?i)\s*-\s*Topic\b|\bVEVO\b|\bOfficial\s+(?:Audio|Video|Music\s+Video)\b|\bLyrics?\b|\bLyric\s+Video\b",
+        "",
+        text,
+    )
     text = re.sub(r"\([^)]*\)|\[[^]]*\]", "", text)
     return " ".join(re.sub(r"\*+", " ", text).split()).strip(" -–—")
 
@@ -1097,10 +1219,70 @@ def _parse_favorite_item(fav: Mapping[str, Any]) -> dict[str, Any]:
     title = _clean_favorite_text(raw_title)
     artist = _clean_favorite_text(raw_artist)
     parts = re.split(r"\s*[-–—]\s*", title, maxsplit=1)
-    real_artist, clean_title = (" ".join(parts[0].split()), " ".join(parts[1].split())) if len(parts) == 2 else (artist, title)
+    real_artist, clean_title = (
+        (" ".join(parts[0].split()), " ".join(parts[1].split()))
+        if len(parts) == 2
+        else (artist, title)
+    )
     source = f"{raw_title} {raw_artist}".lower()
-    vibe = next((v for v, words in (("aggressive", ("slowed", "reverb", "phonk", "drift", "hard", "murder", "rage", "hyperpop", "trap", "zxcursed", "shadowraze")), ("calm", ("lofi", "lo-fi", "ambient", "chill", "snowfall", "piano", "sleep", "instrumental")), ("sad", ("sad", "doomer", "post-punk", "melancholy", "acoustic", "инди", "пост-панк", "грустн")), ("energetic", ("dance", "remix", "club", "house", "pop", "edm"))) if any(w in source for w in words)), "energetic")
-    return {"artist": real_artist, "extra_artist": artist if artist.lower() != real_artist.lower() else "", "title": clean_title, "vibe": vibe}
+    vibe = next(
+        (
+            v
+            for v, words in (
+                (
+                    "aggressive",
+                    (
+                        "slowed",
+                        "reverb",
+                        "phonk",
+                        "drift",
+                        "hard",
+                        "murder",
+                        "rage",
+                        "hyperpop",
+                        "trap",
+                        "zxcursed",
+                        "shadowraze",
+                    ),
+                ),
+                (
+                    "calm",
+                    (
+                        "lofi",
+                        "lo-fi",
+                        "ambient",
+                        "chill",
+                        "snowfall",
+                        "piano",
+                        "sleep",
+                        "instrumental",
+                    ),
+                ),
+                (
+                    "sad",
+                    (
+                        "sad",
+                        "doomer",
+                        "post-punk",
+                        "melancholy",
+                        "acoustic",
+                        "инди",
+                        "пост-панк",
+                        "грустн",
+                    ),
+                ),
+                ("energetic", ("dance", "remix", "club", "house", "pop", "edm")),
+            )
+            if any(w in source for w in words)
+        ),
+        "energetic",
+    )
+    return {
+        "artist": real_artist,
+        "extra_artist": artist if artist.lower() != real_artist.lower() else "",
+        "title": clean_title,
+        "vibe": vibe,
+    }
 
 
 def _normalize_song_title(title: Any) -> str:
@@ -1113,20 +1295,7 @@ def build_taste_profile(
     max_artists: int = 8,
     sample_size: int | None = None,
 ) -> list[str]:
-    """Derive yt-dlp queries from the user's favorites (pure helper).
-
-    Artists are ranked by how often they appear in the favorites; the top
-    ``max_artists`` distinct (case-insensitive) names become one search each.
-    Tracks without an artist cannot anchor a query and are skipped. An empty
-    (or artist-less) list means "no taste profile" -> the caller falls back.
-
-    With ``sample_size`` set (used by the personalized wave) the profile is
-    randomized per call: up to ``sample_size`` ranked artists are sampled and
-    the wording alternates ("official audio" / "track" / "популярные треки"),
-    producing a shuffled, differently-worded query batch every time. Without
-    it the output stays deterministic ("{artist} official audio") for tests
-    and callers that want a stable profile.
-    """
+    """Derive yt-dlp queries from the user's favorites (pure helper)."""
     counts: dict[str, dict[str, int]] = {}
     order: dict[str, str] = {}
     favorite_ids: set[str] = set()
@@ -1190,13 +1359,7 @@ def _merge_wave_results(
     favorite_ids: set[str] | None = None,
     favorite_titles: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Merge concurrent search result lists into one curated wave list.
-
-    Drops duplicates by ``track_id``, favorites the user already saved,
-    tracks outside the wave duration window and any artist over the
-    diversity cap. ``results`` may contain non-tracks (exceptions /
-    ``None``) that are silently ignored.
-    """
+    """Merge concurrent search result lists into one curated wave list."""
     seen = set(favorite_ids or set())
     title_keys = set(favorite_titles or set())
     artist_counts: dict[str, int] = {}
@@ -1211,7 +1374,11 @@ def _merge_wave_results(
             if not track_id or track_id in seen:
                 continue
             key = _normalize_song_title(track.get("title"))
-            if key and any(key == liked or key in liked or liked in key for liked in title_keys if liked):
+            if key and any(
+                key == liked or key in liked or liked in key
+                for liked in title_keys
+                if liked
+            ):
                 continue
             if not _is_wave_track(track):
                 continue
@@ -1243,6 +1410,7 @@ def _merge_wave_results(
 
 async def _wave_search_queries(queries: list[str], per_query: int) -> list[Any]:
     """Run several wave searches in parallel, tolerating partial failures."""
+
     async def run_one(query: str) -> list[dict[str, Any]]:
         return await search_tracks(query, limit=per_query)
 
@@ -1256,29 +1424,21 @@ async def _wave_search_queries(queries: list[str], per_query: int) -> list[Any]:
     except asyncio.CancelledError:
         raise
     except asyncio.TimeoutError as exc:
-        raise AudioServiceError("Сборка волны заняла слишком много времени и была прервана") from exc
+        raise AudioServiceError(
+            "Сборка волны заняла слишком много времени и была прервана"
+        ) from exc
 
 
 def _wave_per_query_limit(limit: int, query_count: int) -> int:
     """Results to ask per query so the final list reaches ``limit``."""
     if query_count <= 0:
         return limit
-    # Filters drop a portion of each pool; ask for extra candidates.
     per_query = max(SEARCH_POOL_SIZE // 2, (limit // query_count) + 4)
     return min(per_query, MAX_SEARCH_RESULTS)
 
 
 async def get_wave_by_mood(vibe: str, limit: int = 15) -> list[dict[str, Any]]:
-    """Return a 15-20 track wave matching the requested mood/vibe.
-
-    Every vibe maps to a wide pool of YouTube point-queries (concrete
-    artists and single-track searches) run through the regular
-    :func:`search_tracks` pipeline (filters, timeouts and the worker thread
-    are shared). Each call takes a *random* sample of the pool first and
-    refills with further random batches while the list is still short, so
-    consecutive runs produce fresh, non-repeating waves. If every search
-    fails the service error is propagated.
-    """
+    """Return a 15-20 track wave matching the requested mood/vibe."""
     cleaned_vibe = str(vibe or "").strip().lower()
     pool = list(WAVE_MOOD_QUERIES.get(cleaned_vibe) or [])
     if not pool:
@@ -1290,11 +1450,9 @@ async def get_wave_by_mood(vibe: str, limit: int = 15) -> list[dict[str, Any]]:
         safe_limit = 15
     safe_limit = max(1, min(safe_limit, MAX_SEARCH_RESULTS))
 
-    # Fresh wave on every run: shuffle the pool and fire a random 6-7 query
-    # sketch instead of the same three queries every time.
     random.shuffle(pool)
     first_batch = pool[:WAVE_QUERY_BATCH_SIZE]
-    remaining = pool[len(first_batch):]
+    remaining = pool[len(first_batch) :]
 
     merged = await _wave_search_queries(
         first_batch, _wave_per_query_limit(safe_limit, len(first_batch))
@@ -1303,11 +1461,9 @@ async def get_wave_by_mood(vibe: str, limit: int = 15) -> list[dict[str, Any]]:
     random.shuffle(tracks)
     seen = {track["track_id"] for track in tracks}
 
-    # Filters (duration window, cap per artist) can leave the list short:
-    # refill from untouched random portions of this vibe's pool up to limit.
     while len(tracks) < safe_limit and remaining:
         batch = remaining[:WAVE_TOPUP_BATCH_SIZE]
-        remaining = remaining[len(batch):]
+        remaining = remaining[len(batch) :]
         merged = await _wave_search_queries(
             batch, _wave_per_query_limit(safe_limit, len(batch))
         )
@@ -1326,40 +1482,26 @@ async def get_wave_by_mood(vibe: str, limit: int = 15) -> list[dict[str, Any]]:
 async def get_wave_personalized(
     favorites: list[dict[str, Any]] | None, limit: int = 15
 ) -> list[dict[str, Any]]:
-    """Return a personalized wave built from the user's favorite tracks.
-
-    The likes are parsed once (:func:`_parse_favorite_item`): the real artist
-    is taken from the ``"Artist - Song"`` title split, a vibe is detected from
-    style keywords, and normalized song titles are collected for the hard
-    anti-duplicate filter. Candidates come, in order, from:
-
-    1. a randomized taste profile (top favorite artists, alternating wording);
-    2. Deezer discovery (:func:`_discover_similar_tracks_sync`): other songs
-       by the favorite artists plus tracks of related artists;
-    3. style queries for the detected vibe (e.g. slowed/phonk for aggressive
-       likes).
-
-    Only then, while the list is still short, it is topped up from the mood
-    pool matching the detected vibe — never from the generic trending pop
-    fallback when the user has likes. With no likes at all the wave mixes
-    every mood pool plus the trending fallback. A fully empty result is
-    ``[]`` so the API layer can fall back to the default chart gracefully.
-    """
+    """Return a personalized wave built from the user's favorite tracks."""
     try:
         safe_limit = int(limit)
     except (TypeError, ValueError):
         safe_limit = 15
     safe_limit = max(1, min(safe_limit, MAX_SEARCH_RESULTS))
 
-    parsed = [_parse_favorite_item(f) for f in (favorites or []) if isinstance(f, Mapping)]
-    artist_names = list(dict.fromkeys(p["artist"] for p in parsed if p["artist"]))[:5]
-    # Vibe of the wave = the majority vibe across all likes (not just the
-    # first one, which could carry no style keywords at all). Ties are broken
-    # towards the most specific vibe — "energetic" is the no-keyword default,
-    # so an explicit aggressive/sad/calm vote always wins it.
+    parsed = [
+        _parse_favorite_item(f)
+        for f in (favorites or [])
+        if isinstance(f, Mapping)
+    ]
+    artist_names = list(dict.fromkeys(p["artist"] for p in parsed if p["artist"]))[
+        :5
+    ]
     vibe_counts: dict[str, int] = {}
     for parsed_item in parsed:
-        vibe_counts[parsed_item["vibe"]] = vibe_counts.get(parsed_item["vibe"], 0) + 1
+        vibe_counts[parsed_item["vibe"]] = (
+            vibe_counts.get(parsed_item["vibe"], 0) + 1
+        )
     if vibe_counts:
         best_count = max(vibe_counts.values())
         detected_vibe = next(
@@ -1369,8 +1511,14 @@ async def get_wave_personalized(
         )
     else:
         detected_vibe = "energetic"
-    favorite_titles = {_normalize_song_title(x) for p in parsed for x in (p["title"],)}
-    favorite_titles.update(_normalize_song_title(f.get("title")) for f in (favorites or []) if isinstance(f, Mapping))
+    favorite_titles = {
+        _normalize_song_title(x) for p in parsed for x in (p["title"],)
+    }
+    favorite_titles.update(
+        _normalize_song_title(f.get("title"))
+        for f in (favorites or [])
+        if isinstance(f, Mapping)
+    )
     profile = build_taste_profile(favorites, max_artists=8, sample_size=5)
 
     favorite_ids = {
@@ -1390,12 +1538,12 @@ async def get_wave_personalized(
         merged = await _wave_search_queries(
             fresh, _wave_per_query_limit(safe_limit, len(fresh))
         )
-        more = _merge_wave_results(merged, safe_limit - len(tracks), seen, favorite_titles)
+        more = _merge_wave_results(
+            merged, safe_limit - len(tracks), seen, favorite_titles
+        )
         tracks.extend(more)
         seen.update(track["track_id"] for track in more)
 
-    # Round 1: taste-profile artists, extra wording for new songs by them and
-    # the style queries derived from the user's own likes.
     artist_queries = [
         query
         for artist in artist_names[:3]
@@ -1404,18 +1552,25 @@ async def get_wave_personalized(
     style_queries = list(VIBE_STYLE_QUERIES.get(detected_vibe, ()))
     await gather_batch(profile + artist_queries + style_queries)
 
-    # Round 2: Deezer — other songs by favorite artists + related artists.
     if artist_names:
         try:
-            discovered = await asyncio.wait_for(asyncio.to_thread(_discover_similar_tracks_sync, artist_names, favorite_titles, safe_limit), timeout=10)
-            merged = _merge_wave_results([discovered], safe_limit - len(tracks), seen, favorite_titles)
+            discovered = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _discover_similar_tracks_sync,
+                    artist_names,
+                    favorite_titles,
+                    safe_limit,
+                ),
+                timeout=10,
+            )
+            merged = _merge_wave_results(
+                [discovered], safe_limit - len(tracks), seen, favorite_titles
+            )
             tracks.extend(merged)
             seen.update(t["track_id"] for t in merged)
         except (asyncio.TimeoutError, Exception):
             logger.debug("Deezer personalized discovery failed", exc_info=True)
 
-    # Still short? Top up from the mood pool matching the user's likes only —
-    # the generic trending pop fallback is reserved for users with no likes.
     if parsed:
         topup_pool = list(WAVE_MOOD_QUERIES.get(detected_vibe, ()))
     else:
@@ -1441,30 +1596,83 @@ async def get_wave_personalized(
     return tracks
 
 
-def _discover_similar_tracks_sync(artists: list[str], favorite_titles: set[str], limit: int) -> list[dict[str, Any]]:
+def _discover_similar_tracks_sync(
+    artists: list[str], favorite_titles: set[str], limit: int
+) -> list[dict[str, Any]]:
     tracks: list[dict[str, Any]] = []
     try:
-        with httpx.Client(timeout=8.0) as client:
+        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
             for artist in artists[:5]:
                 try:
-                    found = client.get("https://api.deezer.com/search/artist", params={"q": artist, "limit": 1}).json().get("data", [])
-                    if not found: continue
+                    found = (
+                        client.get(
+                            "https://api.deezer.com/search/artist",
+                            params={"q": artist, "limit": 1},
+                        )
+                        .json()
+                        .get("data", [])
+                    )
+                    if not found:
+                        continue
                     aid = found[0]["id"]
-                    for endpoint, cap in ((f"artist/{aid}/top", 2), (f"artist/{aid}/related", 3)):
-                        data = client.get(f"https://api.deezer.com/{endpoint}", params={"limit": 10 if cap == 2 else 6}).json().get("data", [])
+                    for endpoint, cap in (
+                        (f"artist/{aid}/top", 2),
+                        (f"artist/{aid}/related", 3),
+                    ):
+                        data = (
+                            client.get(
+                                f"https://api.deezer.com/{endpoint}",
+                                params={"limit": 10 if cap == 2 else 6},
+                            )
+                            .json()
+                            .get("data", [])
+                        )
                         if cap == 3:
-                            data = [tr for rel in data[:3] for tr in client.get(f"https://api.deezer.com/artist/{rel['id']}/top", params={"limit": 5}).json().get("data", [])]
+                            data = [
+                                tr
+                                for rel in data[:3]
+                                for tr in client.get(
+                                    f"https://api.deezer.com/artist/{rel['id']}/top",
+                                    params={"limit": 5},
+                                )
+                                .json()
+                                .get("data", [])
+                            ]
                         count = 0
                         for item in data:
                             title = str(item.get("title") or "")
-                            if title and _normalize_song_title(title) not in favorite_titles:
-                                tracks.append({"track_id": f"deezer:{item.get('id')}", "title": f"{item.get('artist', {}).get('name', artist)} - {title}", "artist": item.get("artist", {}).get("name", artist), "duration": item.get("duration", 180), "thumbnail": ""})
+                            if (
+                                title
+                                and _normalize_song_title(title)
+                                not in favorite_titles
+                            ):
+                                album = item.get("album") or {}
+                                cover = str(
+                                    album.get("cover_big")
+                                    or album.get("cover_medium")
+                                    or ""
+                                ).strip()
+                                tracks.append(
+                                    {
+                                        "track_id": f"deezer:{item.get('id')}",
+                                        "title": f"{item.get('artist', {}).get('name', artist)} - {title}",
+                                        "artist": item.get("artist", {}).get(
+                                            "name", artist
+                                        ),
+                                        "duration": item.get("duration", 180),
+                                        "thumbnail": cover,
+                                    }
+                                )
                                 count += 1
-                            if count >= cap: break
+                            if count >= cap:
+                                break
                 except Exception:
-                    logger.debug("Deezer lookup for %r failed", artist, exc_info=True)
+                    logger.debug(
+                        "Deezer lookup for %r failed", artist, exc_info=True
+                    )
                     continue
-                if len(tracks) >= limit: break
+                if len(tracks) >= limit:
+                    break
     except Exception:
         logger.debug("Deezer discovery failed entirely", exc_info=True)
         return []
@@ -1481,21 +1689,47 @@ def _track_webpage_url(track_id: str) -> str:
     return f"https://www.youtube.com/watch?v={quote(track_id, safe='')}"
 
 
+def _resolve_deezer_stream_url_sync(deezer_id: str) -> str:
+    """Resolve a direct preview MP3 URL from the public Deezer track API."""
+    try:
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            response = client.get(
+                f"https://api.deezer.com/track/{quote(deezer_id, safe='')}",
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": BROWSER_USER_AGENT,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        raise AudioServiceError(
+            f"Не удалось получить аудиопоток Deezer для {deezer_id!r}"
+        ) from exc
+
+    preview_url = str(payload.get("preview") or "").strip()
+    if not preview_url:
+        raise AudioServiceError(
+            f"Deezer не вернул аудиопоток для {deezer_id!r}"
+        )
+    return preview_url
+
+
 def _get_audio_stream_url_sync(track_id: str) -> str:
+    if track_id.startswith("deezer:"):
+        deezer_id = track_id.split(":", 1)[1].strip()
+        if not deezer_id:
+            raise AudioServiceError("Пустой идентификатор трека Deezer")
+        return _resolve_deezer_stream_url_sync(deezer_id)
+
     params = {
+        **_yt_dlp_base_params(),
         "format": "bestaudio[ext=m4a]/bestaudio",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "skip_download": True,
     }
 
     try:
-        with yt_dlp.YoutubeDL(params) as ydl:
-            info = ydl.extract_info(
-                _track_webpage_url(track_id), download=False
-            )
-    except Exception as exc:  # yt-dlp raises different exception types
+        info = _ydl_extract_info(_track_webpage_url(track_id), params)
+    except Exception as exc:
         raise AudioServiceError(
             f"Не удалось получить аудиопоток для {track_id!r}"
         ) from exc
@@ -1503,7 +1737,6 @@ def _get_audio_stream_url_sync(track_id: str) -> str:
     if not isinstance(info, Mapping):
         raise AudioServiceError(f"Пустой ответ yt-dlp для {track_id!r}")
 
-    # noplaylist=True should prevent this, but keep a defensive fallback.
     entries = info.get("entries")
     if entries:
         for entry in entries:
@@ -1558,6 +1791,176 @@ async def get_audio_stream_url(track_id: str) -> str:
         ) from exc
 
 
+# ------------------------------------------------------------- audio file cache
+
+
+_AUDIO_CACHE_DIR_NAME = "tg-music-audio-cache"
+_AUDIO_CACHE_MAX_FILE_BYTES = 64 * 1024 * 1024
+_AUDIO_CACHE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+_DOWNLOAD_CHUNK_SIZE = 256 * 1024
+
+# track_id -> cached file path. Rebuilt lazily after a restart: files live in
+# the system temp directory and are re-adopted when they still exist.
+_audio_cache_index: dict[str, Path] = {}
+_audio_cache_locks: dict[str, asyncio.Lock] = {}
+
+
+def _audio_cache_dir() -> Path:
+    directory = Path(tempfile.gettempdir()) / _AUDIO_CACHE_DIR_NAME
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _audio_cache_key(track_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", track_id)[:120]
+
+
+def audio_media_type_for(track_id: str) -> str:
+    """Best-effort media type for a cached track."""
+    if track_id.startswith("deezer:"):
+        return "audio/mpeg"
+    return "audio/mp4"
+
+
+def _audio_cache_prune() -> None:
+    """Drop the oldest cached files until the total size fits the budget."""
+    entries = [
+        (path, path.stat().st_size, path.stat().st_mtime)
+        for path in _audio_cache_dir().glob("*.m4a")
+        if path.is_file()
+    ]
+    entries += [
+        (path, path.stat().st_size, path.stat().st_mtime)
+        for path in _audio_cache_dir().glob("*.mp3")
+        if path.is_file()
+    ]
+    total = sum(size for _, size, _ in entries)
+    if total <= _AUDIO_CACHE_MAX_TOTAL_BYTES:
+        return
+    for path, size, _ in sorted(entries, key=lambda item: item[2]):
+        if total <= _AUDIO_CACHE_MAX_TOTAL_BYTES:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        for key, value in list(_audio_cache_index.items()):
+            if value == path:
+                _audio_cache_index.pop(key)
+
+
+async def _download_audio_to_cache(
+    track_id: str, stream_url: str, destination: Path
+) -> None:
+    """Download the whole track once through the proxied stream client.
+
+    The VPN route to the CDN sporadically drops the connection mid-body;
+    instead of restarting from zero, the download resumes with a
+    ``Range`` request from the received offset (the CDN supports it).
+    """
+    client = await _get_stream_client()
+    part_path = destination.with_name(destination.name + ".part")
+    response: httpx.Response | None = None
+    expected_size: int | None = None
+    try:
+        written = 0
+        for attempt in range(3):
+            headers = {
+                "Accept": "*/*",
+                "Accept-Encoding": "identity",
+                "User-Agent": BROWSER_USER_AGENT,
+            }
+            if written > 0:
+                # Resume from where the previous attempt was cut off.
+                headers["Range"] = f"bytes={written}-"
+            request = client.build_request("GET", stream_url, headers=headers)
+            response = await client.send(request, stream=True)
+            response.raise_for_status()
+            if expected_size is None:
+                content_length = response.headers.get("content-length", "")
+                if content_length.isdigit():
+                    expected_size = int(content_length)
+
+            with part_path.open("ab" if attempt else "wb") as fh:
+                async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_SIZE):
+                    if chunk:
+                        fh.write(chunk)
+            await response.aclose()
+            response = None
+
+            written = part_path.stat().st_size
+            if written > _AUDIO_CACHE_MAX_FILE_BYTES:
+                raise AudioServiceError(
+                    f"Аудиофайл {track_id!r} слишком большой для кэша"
+                )
+            if expected_size is None or written >= expected_size:
+                break
+            logger.warning(
+                "CDN оборвал загрузку %r на %d/%d байт; докачиваю (попытка %d)",
+                track_id,
+                written,
+                expected_size,
+                attempt + 2,
+            )
+
+        if written == 0:
+            raise AudioServiceError(f"Пустой аудиофайл для {track_id!r}")
+        if expected_size is not None and written < expected_size:
+            raise AudioServiceError(
+                f"Не удалось докачать аудио для {track_id!r} "
+                f"({written}/{expected_size} байт)"
+            )
+        os.replace(part_path, destination)
+    except AudioServiceError:
+        part_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        part_path.unlink(missing_ok=True)
+        raise AudioServiceError(
+            f"Не удалось скачать аудио для {track_id!r}"
+        ) from exc
+    finally:
+        if response is not None:
+            await response.aclose()
+
+
+async def get_cached_audio_file(track_id: str) -> Path:
+    """Return a local, fully downloaded copy of the track's audio.
+
+    The first call for a track resolves the direct URL and downloads the
+    whole file through the proxy; every later call (including the browser's
+    Range/prefetch requests) is served straight from disk without touching
+    the CDN or yt-dlp again.
+    """
+    cleaned_track_id = str(track_id or "").strip()
+    if not cleaned_track_id:
+        raise ValueError("track_id is required")
+
+    destination = (
+        _audio_cache_dir()
+        / f"{_audio_cache_key(cleaned_track_id)}{'.mp3' if cleaned_track_id.startswith('deezer:') else '.m4a'}"
+    )
+
+    lock = _audio_cache_locks.setdefault(cleaned_track_id, asyncio.Lock())
+    async with lock:
+        cached = _audio_cache_index.get(cleaned_track_id)
+        if cached is not None and cached.is_file():
+            # Touch for the LRU prune (mtime-based).
+            os.utime(cached, None)
+            return cached
+        if destination.is_file() and destination.stat().st_size > 0:
+            _audio_cache_index[cleaned_track_id] = destination
+            os.utime(destination, None)
+            return destination
+
+        stream_url = await get_audio_stream_url(cleaned_track_id)
+        await _download_audio_to_cache(cleaned_track_id, stream_url, destination)
+        _audio_cache_index[cleaned_track_id] = destination
+        _audio_cache_prune()
+        return destination
+
+
 # -------------------------------------------------------------------- proxying
 
 
@@ -1588,7 +1991,6 @@ def _response_headers(response: httpx.Response) -> dict[str, str]:
 def _media_type(response: httpx.Response) -> str:
     content_type = response.headers.get("content-type", "audio/mp4")
     media_type = content_type.split(";", 1)[0].strip() or "audio/mp4"
-    # YouTube sometimes labels m4a audio as video/mp4.
     if media_type in {"video/mp4", "application/mp4"}:
         return "audio/mp4"
     return media_type
@@ -1601,19 +2003,7 @@ async def start_audio_stream(
     client: httpx.AsyncClient | None = None,
     chunk_size: int = CHUNK_SIZE,
 ) -> AudioStream:
-    """Open an upstream audio stream and return its status, headers and body.
-
-    When no explicit ``client`` is passed, the process-wide client from
-    :func:`_get_stream_client` is used, so consecutive streams reuse pooled
-    connections instead of repeating the TCP+TLS handshake.
-
-    The returned body iterator closes the upstream response in a ``finally``
-    block, so it is safe to hand it to
-    :class:`fastapi.responses.StreamingResponse`. The client itself is never
-    closed here: the shared one is owned by the app lifespan (call
-    :func:`close_stream_client` on shutdown), and an explicitly passed client
-    is owned by its caller.
-    """
+    """Open an upstream audio stream and return its status, headers and body."""
     target = str(url or "").strip()
     if not target:
         raise ValueError("url is required")
@@ -1624,16 +2014,33 @@ async def start_audio_stream(
         client = await _get_stream_client()
 
     response: httpx.Response | None = None
-    try:
-        request = client.build_request(
-            "GET", target, headers=_request_headers(range_header)
-        )
-        response = await client.send(request, stream=True)
-        response.raise_for_status()
-    except Exception:
-        if response is not None:
-            await response.aclose()
-        raise
+    # A SOCKS connect to the CDN sporadically times out on the first
+    # attempt even though the very next one succeeds, so transport-level
+    # failures get one extra try before surfacing a 502 to the client.
+    for attempt in (1, 2):
+        try:
+            request = client.build_request(
+                "GET", target, headers=_request_headers(range_header)
+            )
+            response = await client.send(request, stream=True)
+            response.raise_for_status()
+            break
+        except httpx.TransportError as exc:
+            if response is not None:
+                await response.aclose()
+                response = None
+            if attempt == 1:
+                logger.warning(
+                    "Транспортная ошибка при открытии аудиопотока (%s); "
+                    "повторяю попытку",
+                    type(exc).__name__,
+                )
+                continue
+            raise
+        except Exception:
+            if response is not None:
+                await response.aclose()
+            raise
 
     async def body() -> AsyncIterator[bytes]:
         try:
@@ -1658,11 +2065,7 @@ async def proxy_audio_stream(
     client: httpx.AsyncClient | None = None,
     chunk_size: int = CHUNK_SIZE,
 ) -> AsyncIterator[bytes]:
-    """Yield proxied audio chunks, forwarding ``Range`` for seeking.
-
-    The upstream response status/headers are available through
-    :func:`start_audio_stream`; this generator is the minimal streaming API.
-    """
+    """Yield proxied audio chunks, forwarding ``Range`` for seeking."""
     stream = await start_audio_stream(
         url,
         range_header,

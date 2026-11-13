@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 import backend.api as api_module
 from backend.api import create_app
-from backend.audio_service import AudioServiceError, AudioStream
+from backend.audio_service import AudioServiceError
 
 AUTH_BOT_TOKEN = "7000000000:AAExampleTokenForTests"
 
@@ -218,75 +218,62 @@ def test_search_endpoint_maps_service_errors_to_502(tmp_path, monkeypatch):
         assert "search failed" in response.json()["detail"]
 
 
-def test_stream_endpoint_proxies_range(tmp_path, monkeypatch):
+def test_stream_endpoint_serves_cached_file_with_range(tmp_path, monkeypatch):
     app = create_app(db_path=tmp_path / "api.db")
     captured = {}
+    audio_file = tmp_path / "cached.m4a"
+    audio_file.write_bytes(b"0123456789" * 10)
 
-    async def fake_get_url(track_id):
+    async def fake_cached(track_id):
         captured["track_id"] = track_id
-        return "https://cdn.example/audio"
+        return audio_file
 
-    async def fake_body():
-        yield b"0123456789"
-
-    async def fake_start(url, range_header=None, **kwargs):
-        captured["url"] = url
-        captured["range"] = range_header
-        return AudioStream(
-            status_code=206,
-            headers={
-                "Content-Type": "audio/mp4",
-                "Content-Range": "bytes 0-9/100",
-                "Content-Length": "10",
-                "Accept-Ranges": "bytes",
-            },
-            media_type="audio/mp4",
-            body=fake_body(),
-        )
-
-    monkeypatch.setattr(api_module, "get_audio_stream_url", fake_get_url)
-    monkeypatch.setattr(api_module, "start_audio_stream", fake_start)
+    monkeypatch.setattr(api_module, "get_cached_audio_file", fake_cached)
 
     with TestClient(app) as client:
-        response = client.get(
+        ranged = client.get(
             "/api/stream/abc123", headers={"Range": "bytes=0-9"}
         )
 
-        assert response.status_code == 206
-        assert response.content == b"0123456789"
-        assert response.headers["content-range"] == "bytes 0-9/100"
-        assert response.headers["accept-ranges"] == "bytes"
-        assert response.headers["content-type"] == "audio/mp4"
-        assert captured == {
-            "track_id": "abc123",
-            "url": "https://cdn.example/audio",
-            "range": "bytes=0-9",
-        }
+        assert ranged.status_code == 206
+        assert ranged.content == b"0123456789"
+        assert ranged.headers["content-range"] == "bytes 0-9/100"
+        assert ranged.headers["content-length"] == "10"
+        assert ranged.headers["accept-ranges"] == "bytes"
+        assert ranged.headers["content-type"] == "audio/mp4"
+        assert captured == {"track_id": "abc123"}
+
+        full = client.get("/api/stream/abc123")
+        assert full.status_code == 200
+        assert full.content == b"0123456789" * 10
+        assert full.headers["content-length"] == "100"
+
+        suffix = client.get("/api/stream/abc123", headers={"Range": "bytes=-10"})
+        assert suffix.status_code == 206
+        assert suffix.content == b"0123456789"
+        assert suffix.headers["content-range"] == "bytes 90-99/100"
 
 
-def test_stream_endpoint_maps_service_and_range_errors(tmp_path, monkeypatch):
+def test_stream_endpoint_maps_errors_and_unsatisfiable_range(
+    tmp_path, monkeypatch
+):
     app = create_app(db_path=tmp_path / "api.db")
 
-    async def failing_url(track_id):
+    async def failing_cache(track_id):
         raise AudioServiceError("no stream")
 
-    monkeypatch.setattr(api_module, "get_audio_stream_url", failing_url)
+    monkeypatch.setattr(api_module, "get_cached_audio_file", failing_cache)
 
     with TestClient(app) as client:
         assert client.get("/api/stream/abc").status_code == 502
 
-    async def working_url(track_id):
-        return "https://cdn.example/audio"
+    audio_file = tmp_path / "cached.m4a"
+    audio_file.write_bytes(b"0123456789" * 10)
 
-    async def failing_range(url, range_header=None, **kwargs):
-        request = httpx.Request("GET", url)
-        response = httpx.Response(416, request=request)
-        raise httpx.HTTPStatusError(
-            "range not satisfiable", request=request, response=response
-        )
+    async def cached(track_id):
+        return audio_file
 
-    monkeypatch.setattr(api_module, "get_audio_stream_url", working_url)
-    monkeypatch.setattr(api_module, "start_audio_stream", failing_range)
+    monkeypatch.setattr(api_module, "get_cached_audio_file", cached)
 
     with TestClient(app) as client:
         response = client.get(

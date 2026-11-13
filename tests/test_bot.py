@@ -48,11 +48,11 @@ def fresh_menu_button_cache():
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("https://example.com", "https://example.com/app"),
-        ("https://example.com/", "https://example.com/app"),
-        ("https://example.com/app", "https://example.com/app"),
-        ("https://example.com/app/", "https://example.com/app"),
-        ("https://example.com/base", "https://example.com/base/app"),
+        ("https://example.com", "https://example.com/app/"),
+        ("https://example.com/", "https://example.com/app/"),
+        ("https://example.com/app", "https://example.com/app/"),
+        ("https://example.com/app/", "https://example.com/app/"),
+        ("https://example.com/base", "https://example.com/base/app/"),
         ("http://localhost:8000", None),
         ("", None),
     ],
@@ -69,10 +69,10 @@ def test_player_keyboard_requires_https():
     assert keyboard is not None
     button = keyboard.inline_keyboard[0][0]
     assert button.text == "🎧 Открыть плеер"
-    assert button.web_app.url == "https://example.com/app"
+    assert button.web_app.url == "https://example.com/app/"
 
     keyboard = build_player_keyboard("https://example.com/app")
-    assert keyboard.inline_keyboard[0][0].web_app.url == "https://example.com/app"
+    assert keyboard.inline_keyboard[0][0].web_app.url == "https://example.com/app/"
 
 
 def test_menu_button_uses_webapp_url():
@@ -82,7 +82,7 @@ def test_menu_button_uses_webapp_url():
     menu_button = build_menu_button("https://example.com")
     assert isinstance(menu_button, MenuButtonWebApp)
     assert menu_button.text == "Плеер"
-    assert menu_button.web_app.url == "https://example.com/app"
+    assert menu_button.web_app.url == "https://example.com/app/"
 
 
 @pytest.mark.asyncio
@@ -93,7 +93,7 @@ async def test_configure_menu_button_installs_webapp_button():
 
     assert installed is True
     assert isinstance(bot.menu_button, MenuButtonWebApp)
-    assert bot.menu_button.web_app.url == "https://example.com/app"
+    assert bot.menu_button.web_app.url == "https://example.com/app/"
 
 
 @pytest.mark.asyncio
@@ -138,7 +138,7 @@ async def test_changed_url_is_installed_again():
     await configure_menu_button(bot, "https://new.example")
 
     assert len(bot.calls) == 2
-    assert bot.menu_button.web_app.url == "https://new.example/app"
+    assert bot.menu_button.web_app.url == "https://new.example/app/"
 
 
 @pytest.mark.asyncio
@@ -163,7 +163,7 @@ async def test_cache_is_per_chat_scope():
 
     assert len(bot.calls) == 2
     assert bot.calls[1] == (bot.calls[1][0], 42)
-    assert bot.menu_button.web_app.url == "https://example.com/app"
+    assert bot.menu_button.web_app.url == "https://example.com/app/"
 
 
 @pytest.mark.asyncio

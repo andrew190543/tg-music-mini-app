@@ -4,4 +4,4 @@ uvicorn[standard]>=0.32,<1
 yt-dlp>=2025.1,<2027
 aiosqlite>=0.20,<1
 python-dotenv>=1.0,<2
-httpx>=0.28,<1
+httpx[socks]>=0.28,<1

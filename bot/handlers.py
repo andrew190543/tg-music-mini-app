@@ -43,18 +43,24 @@ def _current_webapp_url(source: WebAppUrlSource) -> str:
 
 
 def build_player_url(webapp_url: str) -> str | None:
-    """Return the public Mini App URL, adding the ``/app`` suffix when needed.
+    """Return the public Mini App URL, adding the ``/app/`` suffix when needed.
 
     ``WEBAPP_URL`` is documented as a base HTTPS URL. Telegram only accepts
     HTTPS URLs for WebApp buttons, so plain-HTTP values are rejected.
+
+    The URL must end with a trailing slash (``/app/``). The devtunnel relay
+    misdirects the ``/app`` → ``/app/`` slash redirect to ``localhost:8080``
+    once the phishing-protection cookie is set, which breaks the first Mini
+    App open in a browser that replays the original request on reload.
+    Pointing the button straight at ``/app/`` skips the redirect entirely.
     """
     url = (webapp_url or "").strip().rstrip("/")
     if not url.lower().startswith("https://"):
         return None
 
     if url.lower().endswith("/app"):
-        return url
-    return f"{url}/app"
+        return f"{url}/"
+    return f"{url}/app/"
 
 
 def build_player_keyboard(webapp_url: str) -> InlineKeyboardMarkup | None:

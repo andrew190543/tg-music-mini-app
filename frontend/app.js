@@ -2672,11 +2672,40 @@
 
     /* ---------- Track UI ---------- */
 
+    // Hosts allowed to be fetched through the backend /api/thumb proxy.
+    // The Telegram in-app browser ignores the system proxy, so cover CDNs
+    // (i.ytimg.com etc.) are unreachable from it on the direct route.
+    const THUMB_PROXY_SUFFIXES = ["ytimg.com", "dzcdn.net", "deezer.com"];
+
+    function thumbUrl(thumbnail) {
+        const value = String(thumbnail || "").trim();
+        if (!value) {
+            return "";
+        }
+        let url;
+        try {
+            url = new URL(value, window.location.href);
+        } catch {
+            return value;
+        }
+        const host = url.hostname.toLowerCase();
+        const allowed = THUMB_PROXY_SUFFIXES.some(
+            (suffix) => host === suffix || host.endsWith(`.${suffix}`)
+        );
+        // Relative (already-proxied) URLs pass through unchanged, so the
+        // helper is safe to apply repeatedly to the same value.
+        if (url.protocol === "https:" && allowed) {
+            return `/api/thumb?u=${encodeURIComponent(url.href)}`;
+        }
+        return value;
+    }
+
     function applyCover(element, thumbnail) {
         if (!element) {
             return;
         }
 
+        thumbnail = thumbUrl(thumbnail);
         if (thumbnail) {
             element.style.backgroundImage = `url("${String(thumbnail).replace(
                 /"/g,
@@ -2728,7 +2757,7 @@
         if (track.thumbnail) {
             const image = document.createElement("img");
             image.className = "track-card__cover-img";
-            image.src = track.thumbnail;
+            image.src = thumbUrl(track.thumbnail);
             image.alt = "";
             image.loading = "lazy";
             image.decoding = "async";
@@ -3256,7 +3285,7 @@
 
         const artwork = [];
         if (track.thumbnail) {
-            let src = track.thumbnail;
+            let src = thumbUrl(track.thumbnail);
             try {
                 src = new URL(track.thumbnail, window.location.href).href;
             } catch {

@@ -7,27 +7,28 @@ import logging
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Callable, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from config import BASE_DIR, get_auth_mode, get_bot_token, load_settings
+from config import BASE_DIR, get_auth_mode, get_bot_token, get_webapp_url, load_settings
 
 from .audio_service import (
     AudioServiceError,
-    AudioStream,
+    CHUNK_SIZE,
+    _get_stream_client,
+    audio_media_type_for,
     close_stream_client,
-    get_audio_stream_url,
+    get_cached_audio_file,
     get_trending_tracks,
     get_wave_by_mood,
     get_wave_personalized,
     search_tracks,
-    start_audio_stream,
 )
 from .db import MAX_SEARCH_HISTORY, Database
 from .telegram_auth import validate_init_data
@@ -138,6 +139,43 @@ def _soft_user_id(raw_user_id: str | None) -> int | None:
     except ValueError:
         return None
     return value if value > 0 else None
+
+
+def _parse_range_header(
+    value: str, file_size: int
+) -> tuple[int, int] | None:
+    """Parse a single ``Range: bytes=...`` request against ``file_size``.
+
+    Returns an inclusive ``(start, end)`` pair, or ``None`` when the range
+    is unsatisfiable (mapped to HTTP 416 by the caller). Only the first
+    range of a multi-range request is honored — browsers do not send
+    multi-range requests for media playback.
+    """
+    text = value.strip()
+    if not text.startswith("bytes=") or file_size <= 0:
+        return None
+    spec = text[len("bytes=") :].split(",", 1)[0].strip()
+    start_text, _, end_text = spec.partition("-")
+    try:
+        if start_text and end_text:
+            start = int(start_text)
+            end = min(int(end_text), file_size - 1)
+        elif start_text:
+            start = int(start_text)
+            end = file_size - 1
+        elif end_text:
+            suffix = int(end_text)
+            if suffix <= 0:
+                return None
+            start = max(0, file_size - suffix)
+            end = file_size - 1
+        else:
+            return None
+    except ValueError:
+        return None
+    if start < 0 or start > end:
+        return None
+    return (start, end)
 
 
 def _favorite_track(payload: FavoriteCreate) -> dict[str, Any]:
@@ -366,78 +404,109 @@ def create_app(
 
     @app.get("/api/stream/{track_id}", tags=["music"])
     async def stream(track_id: str, request: Request) -> StreamingResponse:
-        """Resolve the direct audio URL and proxy it with Range support.
+        """Serve a fully cached audio file with proper Range support.
 
-        YouTube-signed URLs expire after a while, so a 401/403/410 from the
-        CDN triggers one fresh yt-dlp re-resolution before the endpoint gives
-        up (browsers surface 502 without retrying on their own).
+        The whole track is downloaded once through the proxied client and
+        kept on disk, so the browser's seek/prefetch Range requests are
+        answered locally — no repeated yt-dlp resolutions and no repeated
+        CDN fetches while a track plays.
         """
         cleaned_track_id = track_id.strip()
         if not cleaned_track_id:
             raise HTTPException(status_code=422, detail="track_id is required")
 
-        range_header = request.headers.get("range")
-        audio: AudioStream | None = None
-        last_error: Exception | None = None
+        try:
+            audio_path = await get_cached_audio_file(cleaned_track_id)
+        except AudioServiceError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-        for attempt in (1, 2):
-            try:
-                direct_url = await get_audio_stream_url(cleaned_track_id)
-                audio = await start_audio_stream(direct_url, range_header)
-                break
-            except AudioServiceError as exc:
-                last_error = exc
-                if attempt == 1 and isinstance(
-                    exc.__cause__, asyncio.TimeoutError
-                ):
-                    # A timed-out yt-dlp resolution is likely transient
-                    # (network hiccup); a plain resolve failure (removed
-                    # video, etc.) is not worth the extra latency.
-                    logger.warning(
-                        "Stream resolve timed out for %r, retrying once",
-                        cleaned_track_id,
-                    )
-                    continue
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 416:
-                    raise HTTPException(
-                        status_code=416,
-                        detail="Requested range not satisfiable",
-                    ) from exc
-                if (
-                    exc.response.status_code in (401, 403, 410)
-                    and attempt == 1
-                ):
-                    # The signed URL is almost certainly stale: force a
-                    # fresh yt-dlp resolution instead of failing playback.
-                    logger.warning(
-                        "Upstream %d for %r; re-resolving the signed URL",
-                        exc.response.status_code,
-                        cleaned_track_id,
-                    )
-                    last_error = exc
-                    continue
-                last_error = exc
-                break
+        file_size = audio_path.stat().st_size
+        if file_size <= 0:
+            raise HTTPException(status_code=502, detail="empty cached audio")
 
-        if audio is None:
-            if isinstance(last_error, httpx.HTTPStatusError):
+        start, end = 0, file_size - 1
+        status_code = 200
+        headers: dict[str, str] = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, max-age=3600",
+        }
+
+        range_header = (request.headers.get("range") or "").strip()
+        if range_header:
+            parsed = _parse_range_header(range_header, file_size)
+            if parsed is None:
                 raise HTTPException(
-                    status_code=502,
-                    detail="Upstream audio server returned an error",
-                ) from last_error
-            raise HTTPException(
-                status_code=502, detail=str(last_error)
-            ) from last_error
+                    status_code=416,
+                    detail="Requested range not satisfiable",
+                )
+            start, end = parsed
+            status_code = 206
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
 
-        headers = dict(audio.headers)
-        headers.setdefault("Accept-Ranges", "bytes")
+        length = end - start + 1
+        headers["Content-Length"] = str(length)
+
+        async def file_chunks() -> AsyncIterator[bytes]:
+            remaining = length
+            with audio_path.open("rb") as fh:
+                fh.seek(start)
+                while remaining > 0:
+                    chunk = fh.read(min(CHUNK_SIZE, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
 
         return StreamingResponse(
-            audio.body,
-            status_code=audio.status_code,
+            file_chunks(),
+            status_code=status_code,
             headers=headers,
-            media_type=audio.media_type,
+            media_type=audio_media_type_for(cleaned_track_id),
+        )
+
+    _THUMB_HOST_SUFFIXES = (".ytimg.com", ".dzcdn.net", ".deezer.com")
+    _THUMB_MAX_BYTES = 2_000_000
+
+    @app.get("/api/thumb", tags=["music"])
+    async def thumb(
+        u: Annotated[str, Query(min_length=10, max_length=2000)],
+    ) -> Response:
+        """Proxy a remote cover image through the backend.
+
+        The Telegram in-app browser ignores the system proxy, so cover hosts
+        such as ``i.ytimg.com`` (unreachable on the direct route) never load.
+        The frontend rewrites cover URLs to this endpoint, which fetches them
+        through the same proxied stream client used for the audio.
+        """
+        parsed = urlparse(u)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not host.endswith(_THUMB_HOST_SUFFIXES):
+            raise HTTPException(
+                status_code=422, detail="unsupported thumbnail host"
+            )
+
+        client = await _get_stream_client()
+        try:
+            response = await client.send(client.build_request("GET", u))
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").split(";", 1)[
+                0
+            ].strip()
+            content = response.content
+        except httpx.HTTPError as exc:
+            logger.warning("Не удалось загрузить обложку %r: %s", host, exc)
+            raise HTTPException(
+                status_code=502, detail="thumbnail fetch failed"
+            ) from exc
+        if not content_type.startswith("image/"):
+            raise HTTPException(status_code=502, detail="not an image")
+        if len(content) > _THUMB_MAX_BYTES:
+            raise HTTPException(status_code=502, detail="thumbnail too large")
+
+        return Response(
+            content=content,
+            media_type=content_type or "image/jpeg",
+            headers={"Cache-Control": "public, max-age=86400"},
         )
 
     @app.get("/api/favorites", tags=["favorites"])
@@ -640,6 +709,20 @@ def create_app(
     async def root() -> RedirectResponse:
         """Send users opening the base URL to the Mini App."""
         return RedirectResponse(url="/app/")
+
+    @app.get("/app", include_in_schema=False)
+    async def app_redirect() -> RedirectResponse:
+        """Redirect ``/app`` to ``/app/`` using the configured public URL.
+
+        The devtunnel relay sometimes answers the default host-based slash
+        redirect with ``Location: https://localhost:8080/app/``, which sends
+        the Mini App webview to the local machine and fails its TLS handshake.
+        An explicit redirect to ``WEBAPP_URL`` is immune to that.
+        """
+        webapp_url = get_webapp_url()  # already stripped of a trailing slash
+        if webapp_url.startswith("https://"):
+            return RedirectResponse(url=f"{webapp_url}/app/", status_code=307)
+        return RedirectResponse(url="/app/", status_code=307)
 
     # API routes are declared above the mount so /api/* is never handled by
     # the static files application.

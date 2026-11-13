@@ -12,6 +12,7 @@ import uvicorn
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramConflictError
 from aiogram.types import BotCommand
 from fastapi import FastAPI
 
@@ -40,37 +41,40 @@ def _build_bot_runtime() -> tuple[Bot, Dispatcher] | None:
 
 
 async def _run_bot_polling(bot: Bot, dispatcher: Dispatcher) -> None:
-    """Configure the bot and poll Telegram, restarting after failures.
-
-    Polling must not take down the API and must not die silently either: a
-    transient network failure makes aiogram exit, so wrap it in a bounded
-    backoff loop (worst-case the bot comes back after 30 seconds).
-    """
-    delay = 1.0
+    """Configure the bot and poll Telegram, restarting after failures."""
+    delay = 2.0
     while True:
         started = time.monotonic()
         try:
             try:
+                await bot.delete_webhook(drop_pending_updates=False)
                 await bot.set_my_commands(
                     [BotCommand(command="start", description="Открыть плеер")]
                 )
             except Exception:
                 logger.warning(
-                    "Не удалось обновить команды бота", exc_info=True
+                    "Не удалось обновить команды/webhook бота", exc_info=True
                 )
 
             await configure_menu_button(bot, get_webapp_url())
 
-            # uvicorn owns process signals in embedded mode; the bot must not
-            # install its own SIGINT/SIGTERM handlers or close the shared session.
             await dispatcher.start_polling(
                 bot,
                 allowed_updates=dispatcher.resolve_used_update_types(),
                 handle_signals=False,
                 close_bot_session=False,
+                polling_timeout=20,
             )
         except asyncio.CancelledError:
+            logger.info("Задача поллинга бота остановлена")
             raise
+        except TelegramConflictError:
+            logger.error(
+                "Конфликт токена Telegram (TelegramConflictError): другой "
+                "экземпляр бота @srhehjejh_bot уже запущен! Остановите второй "
+                "процесс (pkill -f main.py). Повтор через %.0f сек...",
+                delay,
+            )
         except Exception:
             logger.exception(
                 "Polling Telegram прерван; перезапуск через %.0f сек", delay
@@ -81,10 +85,8 @@ async def _run_bot_polling(bot: Bot, dispatcher: Dispatcher) -> None:
                 delay,
             )
 
-        # A long-lived poll run resets the backoff: the connection itself
-        # worked, so the next failure is probably unrelated.
         if time.monotonic() - started >= 60.0:
-            delay = 1.0
+            delay = 2.0
 
         try:
             await asyncio.sleep(delay)
@@ -107,7 +109,6 @@ def _print_player_url() -> None:
             print(message, flush=True)
             return
         except UnicodeEncodeError:
-            # Windows consoles may use cp1251/cp866 and cannot encode emoji.
             continue
 
 
@@ -115,21 +116,17 @@ def _print_player_url() -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initialize the shared database and start Telegram polling in background."""
     database = await init_db(settings.db_path)
-    # The API routes read request.app.state.db, so both parts share one
-    # connection and one SQLite WAL session.
     app.state.db = database
 
     _print_player_url()
 
-    # Warm the trending cache in the background: the chart fetches and
-    # yt-dlp lookups take tens of seconds, so without this the very first
-    # /api/trending request would block on the whole network chain.
     warm_task: asyncio.Task[list[dict]] | None = asyncio.create_task(
         get_trending_tracks(20), name="trending-warmup"
     )
 
     bot_task: asyncio.Task[None] | None = None
     bot: Bot | None = None
+    dispatcher: Dispatcher | None = None
 
     runtime = _build_bot_runtime()
     if runtime is None:
@@ -156,12 +153,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        if warm_task is not None:
-            warm_task.cancel()
-            await asyncio.gather(warm_task, return_exceptions=True)
+        if dispatcher is not None:
+            try:
+                await dispatcher.stop_polling()
+            except Exception:
+                pass
         if bot_task is not None:
             bot_task.cancel()
             await asyncio.gather(bot_task, return_exceptions=True)
+        if warm_task is not None:
+            warm_task.cancel()
+            await asyncio.gather(warm_task, return_exceptions=True)
         if bot is not None:
             await bot.session.close()
         await close_stream_client()
@@ -188,16 +190,20 @@ def _configure_logging() -> None:
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     )
-    # Local probes (health, OpenAI-style model discovery) must not flood the
-    # console. Keep the access log for real traffic only.
     logging.getLogger("uvicorn.access").addFilter(_QuietAccessLogFilter())
+    # httpx logs every upstream request (yt-dlp CDN, Deezer, ...) at INFO
+    # with full URLs — that is noise; only real problems are worth showing.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 if __name__ == "__main__":
     _configure_logging()
     uvicorn.run(
-        "main:app",
+        app,
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level.lower(),
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
