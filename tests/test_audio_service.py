@@ -309,6 +309,43 @@ async def test_get_audio_stream_url_raises_without_direct_url(monkeypatch):
         await audio_service.get_audio_stream_url("   ")
 
 
+async def test_get_cached_audio_file_downloads_once(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    async def fake_url(track_id):
+        calls["n"] += 1
+        return "https://cdn.example/audio"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"audio-bytes")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def fake_stream_client():
+        return client
+
+    monkeypatch.setattr(audio_service, "get_audio_stream_url", fake_url)
+    monkeypatch.setattr(audio_service, "_get_stream_client", fake_stream_client)
+    monkeypatch.setattr(audio_service, "_audio_cache_dir", lambda: tmp_path)
+
+    try:
+        first = await audio_service.get_cached_audio_file("cachetest1")
+        second = await audio_service.get_cached_audio_file("cachetest1")
+    finally:
+        await client.aclose()
+
+    assert first == second
+    assert first.is_file()
+    assert first.read_bytes() == b"audio-bytes"
+    # The CDN is hit only once; the second call is a pure disk hit.
+    assert calls["n"] == 1
+
+
+async def test_get_cached_audio_file_requires_track_id():
+    with pytest.raises(ValueError, match="track_id"):
+        await audio_service.get_cached_audio_file("   ")
+
+
 async def test_proxy_audio_stream_forwards_range_and_yields_bytes():
     seen = {}
 

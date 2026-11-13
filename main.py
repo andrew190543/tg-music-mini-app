@@ -1,10 +1,10 @@
-"""Entry point: run FastAPI and the aiogram bot in one event loop."""
+"""Single-command entry point: FastAPI server + Telegram bot polling."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -12,192 +12,176 @@ import uvicorn
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import BotCommand
 from fastapi import FastAPI
 
 from backend.api import create_app
 from backend.audio_service import close_stream_client, get_trending_tracks
-from backend.db import close_db, init_db
+from backend.db import Database
 from bot.handlers import build_router, configure_menu_button
-from config import get_webapp_url, load_settings
+from config import Settings, get_webapp_url, load_settings
 
-settings = load_settings()
 logger = logging.getLogger(__name__)
 
+QUIET_PATHS = ("/health", "/api/health")
+POLLING_BACKOFF_MIN_SECONDS = 2.0
+POLLING_BACKOFF_MAX_SECONDS = 60.0
+MENU_SYNC_INTERVAL_SECONDS = 30.0
 
-def _build_bot_runtime() -> tuple[Bot, Dispatcher] | None:
-    """Create the bot and dispatcher when a usable token is configured."""
-    if not settings.bot_enabled:
-        return None
 
-    bot = Bot(
-        token=settings.bot_token,
+def create_bot(token: str) -> Bot:
+    """Create an aiogram Bot instance with HTML parse mode."""
+    return Bot(
+        token=token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+
+
+def create_dispatcher(webapp_url: str | None = None) -> Dispatcher:
+    """Create a Dispatcher wired with the /start router."""
     dispatcher = Dispatcher()
-    dispatcher.include_router(build_router(get_webapp_url))
-    return bot, dispatcher
-
-
-async def _run_bot_polling(bot: Bot, dispatcher: Dispatcher) -> None:
-    """Configure the bot and poll Telegram, restarting after failures.
-
-    Polling must not take down the API and must not die silently either: a
-    transient network failure makes aiogram exit, so wrap it in a bounded
-    backoff loop (worst-case the bot comes back after 30 seconds).
-    """
-    delay = 1.0
-    while True:
-        started = time.monotonic()
-        try:
-            try:
-                await bot.set_my_commands(
-                    [BotCommand(command="start", description="Открыть плеер")]
-                )
-            except Exception:
-                logger.warning(
-                    "Не удалось обновить команды бота", exc_info=True
-                )
-
-            await configure_menu_button(bot, get_webapp_url())
-
-            # uvicorn owns process signals in embedded mode; the bot must not
-            # install its own SIGINT/SIGTERM handlers or close the shared session.
-            await dispatcher.start_polling(
-                bot,
-                allowed_updates=dispatcher.resolve_used_update_types(),
-                handle_signals=False,
-                close_bot_session=False,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "Polling Telegram прерван; перезапуск через %.0f сек", delay
-            )
-        else:
-            logger.warning(
-                "Polling Telegram завершился штатно; перезапуск через %.0f сек",
-                delay,
-            )
-
-        # A long-lived poll run resets the backoff: the connection itself
-        # worked, so the next failure is probably unrelated.
-        if time.monotonic() - started >= 60.0:
-            delay = 1.0
-
-        try:
-            await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            raise
-        delay = min(delay * 2.0, 30.0)
-
-
-def _print_player_url() -> None:
-    """Show the local player URL, tolerating consoles without emoji support."""
-    url = f"http://127.0.0.1:{settings.port}/app/"
-    messages = (
-        f"INFO: 🎧 Плеер доступен по ссылке: {url}",
-        f"INFO: Плеер доступен по ссылке: {url}",
-        f"INFO: Player URL: {url}",
+    dispatcher.include_router(
+        build_router(webapp_url if webapp_url is not None else get_webapp_url)
     )
-
-    for message in messages:
-        try:
-            print(message, flush=True)
-            return
-        except UnicodeEncodeError:
-            # Windows consoles may use cp1251/cp866 and cannot encode emoji.
-            continue
+    return dispatcher
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Initialize the shared database and start Telegram polling in background."""
-    database = await init_db(settings.db_path)
-    # The API routes read request.app.state.db, so both parts share one
-    # connection and one SQLite WAL session.
-    app.state.db = database
-
-    _print_player_url()
-
-    # Warm the trending cache in the background: the chart fetches and
-    # yt-dlp lookups take tens of seconds, so without this the very first
-    # /api/trending request would block on the whole network chain.
-    warm_task: asyncio.Task[list[dict]] | None = asyncio.create_task(
-        get_trending_tracks(20), name="trending-warmup"
-    )
-
-    bot_task: asyncio.Task[None] | None = None
-    bot: Bot | None = None
-
-    runtime = _build_bot_runtime()
-    if runtime is None:
-        logger.warning(
-            "BOT_TOKEN не задан — запущен только API. "
-            "Укажите токен в .env, чтобы включить Telegram-бота."
-        )
-    else:
-        bot, dispatcher = runtime
-        app.state.bot = bot
-        bot_task = asyncio.create_task(
-            _run_bot_polling(bot, dispatcher), name="telegram-bot"
-        )
-        app.state.bot_task = bot_task
-
-        if not get_webapp_url().startswith("https://"):
-            logger.warning(
-                "WEBAPP_URL пуст или не использует HTTPS — кнопка Mini App "
-                "не будет показана в боте. Для локальной разработки: "
-                "cloudflared tunnel --url http://localhost:8000, затем "
-                "укажите полученный https-адрес в WEBAPP_URL."
-            )
-
-    try:
-        yield
-    finally:
-        if warm_task is not None:
-            warm_task.cancel()
-            await asyncio.gather(warm_task, return_exceptions=True)
-        if bot_task is not None:
-            bot_task.cancel()
-            await asyncio.gather(bot_task, return_exceptions=True)
-        if bot is not None:
-            await bot.session.close()
-        await close_stream_client()
-        await close_db()
+async def sync_menu_button(bot: Bot, webapp_url: str | None = None) -> bool:
+    """Install the global MenuButtonWebApp for the bot."""
+    url = webapp_url if webapp_url is not None else get_webapp_url()
+    return await configure_menu_button(bot, url)
 
 
-app = create_app(db_path=settings.db_path, lifespan=lifespan)
-
-
-class _QuietAccessLogFilter(logging.Filter):
-    """Hide uvicorn access logs for continuous local probes."""
-
-    QUIET_PATHS = {"/health", "/v1/models"}
+class _QuietProbeFilter(logging.Filter):
+    """Drop access-log records for high-frequency health probes."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.args, tuple) and len(record.args) >= 3:
-            path = str(record.args[2]).split("?", 1)[0]
-            return path not in self.QUIET_PATHS
-        return True
+        message = record.getMessage()
+        return not any(
+            f'"{method} {path} ' in message
+            for method in ("GET", "HEAD")
+            for path in QUIET_PATHS
+        )
 
 
-def _configure_logging() -> None:
+async def _watch_menu_button(bot: Bot) -> None:
+    """Periodically re-sync MenuButtonWebApp if WEBAPP_URL changed in .env."""
+    while True:
+        await asyncio.sleep(MENU_SYNC_INTERVAL_SECONDS)
+        with contextlib.suppress(Exception):
+            await sync_menu_button(bot)
+
+
+async def _run_bot_polling(settings: Settings) -> None:
+    """Run aiogram polling in the background while the token is configured."""
+    if not settings.bot_enabled:
+        logger.warning(
+            "BOT_TOKEN is not set in .env — FastAPI is running without "
+            "Telegram bot polling."
+        )
+        return
+
+    dispatcher = create_dispatcher()
+    delay = POLLING_BACKOFF_MIN_SECONDS
+
+    while True:
+        bot = create_bot(settings.bot_token)
+        menu_watcher: asyncio.Task[None] | None = None
+        try:
+            await sync_menu_button(bot)
+            await bot.delete_webhook(drop_pending_updates=True)
+            delay = POLLING_BACKOFF_MIN_SECONDS
+            logger.info(
+                "Starting Telegram bot polling (WEBAPP_URL=%s)",
+                get_webapp_url() or settings.webapp_url,
+            )
+            menu_watcher = asyncio.create_task(
+                _watch_menu_button(bot), name="menu-button-watcher"
+            )
+            await dispatcher.start_polling(bot, handle_signals=False)
+            return
+        except asyncio.CancelledError:
+            logger.info("Telegram bot polling stopped")
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Telegram bot polling failed (%s: %s); retrying in %.0fs. "
+                "FastAPI stays online.",
+                type(exc).__name__,
+                exc,
+                delay,
+            )
+        finally:
+            if menu_watcher is not None:
+                menu_watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await menu_watcher
+            with contextlib.suppress(Exception):
+                await bot.session.close()
+
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, POLLING_BACKOFF_MAX_SECONDS)
+
+
+def build_lifespan(settings: Settings):
+    """Create a FastAPI lifespan that owns SQLite and the bot polling task."""
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        database = Database(settings.db_path)
+        await database.connect()
+        app.state.db = database
+
+        warm_task = asyncio.create_task(
+            get_trending_tracks(20), name="trending-warmup"
+        )
+        bot_task = asyncio.create_task(
+            _run_bot_polling(settings), name="telegram-bot-polling"
+        )
+        try:
+            yield
+        finally:
+            warm_task.cancel()
+            bot_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await bot_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await warm_task
+            await close_stream_client()
+            await database.close()
+
+    return lifespan
+
+
+def create_runtime_app(settings: Settings | None = None) -> FastAPI:
+    """Create the FastAPI application wired with the shared runtime lifespan."""
+    resolved = settings or load_settings()
+    return create_app(
+        db_path=resolved.db_path,
+        lifespan=build_lifespan(resolved),
+    )
+
+
+def main() -> None:
+    settings = load_settings()
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    # Local probes (health, OpenAI-style model discovery) must not flood the
-    # console. Keep the access log for real traffic only.
-    logging.getLogger("uvicorn.access").addFilter(_QuietAccessLogFilter())
+    logging.getLogger("uvicorn.access").addFilter(_QuietProbeFilter())
 
+    app = create_runtime_app(settings)
 
-if __name__ == "__main__":
-    _configure_logging()
     uvicorn.run(
-        "main:app",
+        app,
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level.lower(),
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+        timeout_keep_alive=75,
+        timeout_graceful_shutdown=15,
     )
+
+
+if __name__ == "__main__":
+    main()

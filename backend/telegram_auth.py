@@ -1,13 +1,4 @@
-"""Validation of Telegram Mini App ``initData`` per the official HMAC scheme.
-
-Implements the verification described in
-https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
-
-The Mini App sends its raw ``initData`` in the ``Authorization`` header with
-the ``tma`` scheme; the backend re-computes ``hash`` from the sorted
-``data_check_string`` using ``HMAC(bot_secret_key)`` as the key and checks the
-freshness of ``auth_date``.
-"""
+"""Validation of Telegram Mini App ``initData`` per the official HMAC scheme."""
 
 from __future__ import annotations
 
@@ -19,19 +10,13 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
-# Data older than this cannot be trusted: one replay window per day.
 MAX_AUTH_AGE_SECONDS = 24 * 60 * 60
-# ``auth_date`` is generated on the client \u2014 allowance for a small clock skew.
 MAX_CLOCK_SKEW_SECONDS = 300
 
 
 @dataclass(frozen=True, slots=True)
 class InitDataResult:
-    """Outcome of ``initData`` validation.
-
-    On success ``user_id`` is set and ``reason`` is empty; on failure
-    both fields describe why the data was rejected (``user_id`` stays None).
-    """
+    """Outcome of ``initData`` validation."""
 
     user_id: int | None
     reason: str
@@ -50,7 +35,6 @@ def _build_data_check_string(pairs: list[tuple[str, str]]) -> str:
 
 
 def _signature_secret(bot_token: str) -> bytes:
-    # Bot secret key = HMAC_SHA256(bot_token, key="WebAppData").
     return hmac.new(
         b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256
     ).digest()
@@ -83,15 +67,7 @@ def _auth_date_from_pairs(pairs: list[tuple[str, str]]) -> int | None:
 
 
 def validate_init_data(init_data: str, bot_token: str) -> InitDataResult:
-    """Validate signed WebApp ``initData`` and extract the user id.
-
-    The check string is built from **decoded** query parts (``parse_qsl``),
-    sorted lexicographically, with only ``hash`` excluded \u2014 other signature
-    fields (e.g. Ed25519 ``signature``) take part as regular strings.
-
-    Returns a failed :class:`InitDataResult` (never raises) whenever the
-    signature, freshness or user payload does not check out.
-    """
+    """Validate signed WebApp ``initData`` and extract the user id."""
     if not bot_token:
         return InitDataResult(user_id=None, reason="bot token is not configured")
 

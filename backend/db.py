@@ -1,518 +1,453 @@
-"""Asynchronous SQLite storage for favorites, playlists and search history."""
+"""Async SQLite repository for user favorites, search history and playlists."""
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import aiosqlite
 
-MAX_SEARCH_HISTORY = 50
+MAX_SEARCH_HISTORY = 10
+MAX_PLAYLIST_TITLE = 60
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS favorites (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     track_id TEXT NOT NULL,
     title TEXT NOT NULL,
     artist TEXT NOT NULL DEFAULT '',
-    url TEXT NOT NULL,
-    thumbnail TEXT NOT NULL DEFAULT '',
     duration INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (user_id, track_id)
+    thumbnail TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    added_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, track_id)
 );
-CREATE INDEX IF NOT EXISTS idx_favorites_user_created
-    ON favorites (user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_favorites_user_id
-    ON favorites (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_favorites_user_added
+    ON favorites (user_id, added_at DESC);
+
+CREATE TABLE IF NOT EXISTS search_history (
+    user_id INTEGER NOT NULL,
+    query TEXT NOT NULL,
+    searched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, query)
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_history_user_time
+    ON search_history (user_id, searched_at DESC);
 
 CREATE TABLE IF NOT EXISTS playlists (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     title TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
 CREATE INDEX IF NOT EXISTS idx_playlists_user_created
-    ON playlists (user_id, created_at DESC);
+    ON playlists (user_id, created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS playlist_tracks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    playlist_id INTEGER NOT NULL,
+    position INTEGER NOT NULL,
     track_id TEXT NOT NULL,
     title TEXT NOT NULL,
     artist TEXT NOT NULL DEFAULT '',
-    url TEXT NOT NULL,
-    thumbnail TEXT NOT NULL DEFAULT '',
     duration INTEGER NOT NULL DEFAULT 0,
-    position INTEGER NOT NULL DEFAULT 0,
-    added_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (playlist_id, track_id)
+    thumbnail TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    added_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (playlist_id, track_id),
+    FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_playlist_tracks_order
-    ON playlist_tracks (playlist_id, position);
 
-CREATE TABLE IF NOT EXISTS search_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    query TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-CREATE INDEX IF NOT EXISTS idx_search_history_user
-    ON search_history (user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_playlist_tracks_order
+    ON playlist_tracks (playlist_id, position ASC);
 """
 
 
-def _track_values(track: Mapping[str, Any]) -> tuple[str, str, str, str, str, int]:
-    """Validate and normalize a track payload for storage."""
-    track_id = str(track.get("track_id") or track.get("id") or "").strip()
-    title = str(track.get("title") or "").strip()
-    if not track_id or not title:
-        raise ValueError("track_id and title are required")
-
-    artist = str(track.get("artist") or "").strip()
-    url = str(track.get("url") or "").strip()
-    thumbnail = str(track.get("thumbnail") or track.get("thumbnail_url") or "").strip()
+def _normalize_duration(value: Any) -> int:
     try:
-        duration = max(0, int(track.get("duration") or 0))
+        seconds = int(float(value))
     except (TypeError, ValueError):
-        duration = 0
+        return 0
+    return max(0, seconds)
 
-    return track_id, title, artist, url, thumbnail, duration
+
+def _normalize_query(query: str) -> str:
+    return " ".join(str(query or "").split())
+
+
+def _normalize_playlist_title(title: str) -> str:
+    cleaned = " ".join(str(title or "").split())
+    return cleaned[:MAX_PLAYLIST_TITLE]
 
 
 class Database:
-    """Small async repository around a single SQLite connection."""
+    """Small async wrapper around an ``aiosqlite`` connection."""
 
     def __init__(self, path: str | Path) -> None:
-        self.path: str | Path = ":memory:" if str(path) == ":memory:" else Path(path)
-        self._connection: aiosqlite.Connection | None = None
+        self.path = Path(path)
+        self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
 
+    @property
+    def connection(self) -> aiosqlite.Connection:
+        if self._conn is None:
+            raise RuntimeError("Database is not connected")
+        return self._conn
+
     async def connect(self) -> None:
-        """Open the database and create the schema if needed."""
-        if self._connection is not None:
-            return
+        async with self._lock:
+            if self._conn is not None:
+                return
 
-        if isinstance(self.path, Path):
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            target = str(self.path)
-        else:
-            target = self.path
-
-        connection = await aiosqlite.connect(target)
-        try:
-            connection.row_factory = aiosqlite.Row
-            await connection.execute("PRAGMA foreign_keys = ON")
-            await connection.execute("PRAGMA busy_timeout = 5000")
-            await connection.execute("PRAGMA journal_mode = WAL")
-            await connection.executescript(SCHEMA)
-            await connection.commit()
-        except Exception:
-            await connection.close()
-            raise
-
-        self._connection = connection
+            self._conn = await aiosqlite.connect(self.path)
+            self._conn.row_factory = aiosqlite.Row
+            await self._conn.execute("PRAGMA journal_mode=WAL;")
+            await self._conn.execute("PRAGMA foreign_keys=ON;")
+            await self._conn.executescript(SCHEMA)
+            await self._conn.commit()
 
     async def close(self) -> None:
-        """Close the connection, if it is open."""
-        if self._connection is not None:
-            await self._connection.close()
-            self._connection = None
+        async with self._lock:
+            if self._conn is not None:
+                await self._conn.close()
+                self._conn = None
 
     async def ping(self) -> bool:
-        """Return True when the database answers a trivial query."""
-        row = await self._fetch_one("SELECT 1 AS ok")
-        return bool(row and row["ok"] == 1)
+        cursor = await self.connection.execute("SELECT 1;")
+        row = await cursor.fetchone()
+        await cursor.close()
+        return bool(row and row[0] == 1)
 
-    def _db(self) -> aiosqlite.Connection:
-        if self._connection is None:
-            raise RuntimeError("Database is not connected")
-        return self._connection
+    async def add_favorite(self, user_id: int, track: dict[str, Any]) -> bool:
+        """Insert or update a favorite track."""
+        track_id = str(track.get("track_id") or "").strip()
+        title = str(track.get("title") or "").strip()
+        if not track_id or not title:
+            raise ValueError("track_id and title are required")
 
-    async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
-        connection = self._db()
+        artist = str(track.get("artist") or "").strip()
+        duration = _normalize_duration(track.get("duration"))
+        thumbnail = str(track.get("thumbnail") or "").strip()
+        url = str(track.get("url") or "").strip()
+
         async with self._lock:
-            cursor = await connection.execute(sql, params)
-            try:
-                await connection.commit()
-                return cursor.rowcount if cursor.rowcount is not None else 0
-            except Exception:
-                await connection.rollback()
-                raise
-            finally:
-                await cursor.close()
+            cursor = await self.connection.execute(
+                "SELECT 1 FROM favorites WHERE user_id = ? AND track_id = ?;",
+                (int(user_id), track_id),
+            )
+            existed = await cursor.fetchone() is not None
+            await cursor.close()
 
-    async def _fetch_all(
-        self, sql: str, params: tuple[Any, ...] = ()
-    ) -> list[dict[str, Any]]:
-        connection = self._db()
-        async with self._lock:
-            cursor = await connection.execute(sql, params)
-            try:
-                rows = await cursor.fetchall()
-            finally:
-                await cursor.close()
-        return [dict(row) for row in rows]
-
-    async def _fetch_one(
-        self, sql: str, params: tuple[Any, ...] = ()
-    ) -> dict[str, Any] | None:
-        connection = self._db()
-        async with self._lock:
-            cursor = await connection.execute(sql, params)
-            try:
-                row = await cursor.fetchone()
-            finally:
-                await cursor.close()
-        return dict(row) if row is not None else None
-
-    # ------------------------------------------------------------------ favorites
-
-    async def add_favorite(self, user_id: int, track: Mapping[str, Any]) -> bool:
-        """Add a track to favorites. Returns False when it was already there."""
-        values = _track_values(track)
-        changed = await self._execute(
-            """
-            INSERT OR IGNORE INTO favorites
-                (user_id, track_id, title, artist, url, thumbnail, duration)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (int(user_id), *values),
-        )
-        return changed > 0
+            await self.connection.execute(
+                """
+                INSERT INTO favorites (
+                    user_id, track_id, title, artist, duration, thumbnail, url, added_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, track_id) DO UPDATE SET
+                    title = excluded.title,
+                    artist = excluded.artist,
+                    duration = excluded.duration,
+                    thumbnail = excluded.thumbnail,
+                    url = excluded.url,
+                    added_at = CURRENT_TIMESTAMP;
+                """,
+                (int(user_id), track_id, title, artist, duration, thumbnail, url),
+            )
+            await self.connection.commit()
+            return not existed
 
     async def remove_favorite(self, user_id: int, track_id: str) -> bool:
-        """Remove a track from favorites. Returns False when it was absent."""
-        changed = await self._execute(
-            "DELETE FROM favorites WHERE user_id = ? AND track_id = ?",
-            (int(user_id), str(track_id)),
-        )
-        return changed > 0
+        cleaned_id = str(track_id or "").strip()
+        if not cleaned_id:
+            return False
+
+        async with self._lock:
+            cursor = await self.connection.execute(
+                "DELETE FROM favorites WHERE user_id = ? AND track_id = ?;",
+                (int(user_id), cleaned_id),
+            )
+            deleted = cursor.rowcount > 0
+            await cursor.close()
+            await self.connection.commit()
+            return deleted
 
     async def list_favorites(self, user_id: int) -> list[dict[str, Any]]:
-        """Return the user's favorite tracks, newest first."""
-        return await self._fetch_all(
-            """
-            SELECT track_id, title, artist, url, thumbnail, duration, created_at
-            FROM favorites
-            WHERE user_id = ?
-            ORDER BY created_at DESC, id DESC
-            """,
-            (int(user_id),),
-        )
+        async with self._lock:
+            cursor = await self.connection.execute(
+                """
+                SELECT track_id, title, artist, duration, thumbnail, url, added_at
+                FROM favorites
+                WHERE user_id = ?
+                ORDER BY added_at DESC, rowid DESC;
+                """,
+                (int(user_id),),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
 
-    # ------------------------------------------------------------------- history
+    async def add_search_history(self, user_id: int, query: str) -> None:
+        cleaned = _normalize_query(query)
+        if not cleaned:
+            return
 
-    async def add_search_history(self, user_id: int, query: str) -> bool:
-        """Store a search query and keep only the latest MAX_SEARCH_HISTORY rows."""
-        cleaned = " ".join(str(query or "").split())
+        async with self._lock:
+            await self.connection.execute(
+                """
+                INSERT INTO search_history (user_id, query, searched_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, query) DO UPDATE SET
+                    searched_at = CURRENT_TIMESTAMP;
+                """,
+                (int(user_id), cleaned),
+            )
+            await self.connection.execute(
+                """
+                DELETE FROM search_history
+                WHERE user_id = ?
+                  AND query NOT IN (
+                      SELECT query
+                      FROM search_history
+                      WHERE user_id = ?
+                      ORDER BY searched_at DESC, rowid DESC
+                      LIMIT ?
+                  );
+                """,
+                (int(user_id), int(user_id), MAX_SEARCH_HISTORY),
+            )
+            await self.connection.commit()
+
+    async def list_search_history(
+        self, user_id: int, limit: int = MAX_SEARCH_HISTORY
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), MAX_SEARCH_HISTORY))
+        async with self._lock:
+            cursor = await self.connection.execute(
+                """
+                SELECT query, searched_at
+                FROM search_history
+                WHERE user_id = ?
+                ORDER BY searched_at DESC, rowid DESC
+                LIMIT ?;
+                """,
+                (int(user_id), safe_limit),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
+
+    async def delete_search_query(self, user_id: int, query: str) -> bool:
+        cleaned = _normalize_query(query)
         if not cleaned:
             return False
 
-        connection = self._db()
         async with self._lock:
-            try:
-                await connection.execute(
-                    "INSERT INTO search_history (user_id, query) VALUES (?, ?)",
-                    (int(user_id), cleaned),
-                )
-                await connection.execute(
-                    """
-                    DELETE FROM search_history
-                    WHERE user_id = ?
-                      AND id NOT IN (
-                          SELECT id
-                          FROM search_history
-                          WHERE user_id = ?
-                          ORDER BY id DESC
-                          LIMIT ?
-                      )
-                    """,
-                    (int(user_id), int(user_id), MAX_SEARCH_HISTORY),
-                )
-                await connection.commit()
-            except Exception:
-                await connection.rollback()
-                raise
-        return True
-
-    async def list_search_history(
-        self, user_id: int, limit: int = 20
-    ) -> list[dict[str, Any]]:
-        """Return recent search queries, newest first."""
-        safe_limit = max(1, min(int(limit), MAX_SEARCH_HISTORY))
-        return await self._fetch_all(
-            """
-            SELECT query, created_at
-            FROM search_history
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (int(user_id), safe_limit),
-        )
+            cursor = await self.connection.execute(
+                "DELETE FROM search_history WHERE user_id = ? AND query = ?;",
+                (int(user_id), cleaned),
+            )
+            deleted = cursor.rowcount > 0
+            await cursor.close()
+            await self.connection.commit()
+            return deleted
 
     async def clear_search_history(self, user_id: int) -> int:
-        """Delete every stored query for the user and return the row count."""
-        return await self._execute(
-            "DELETE FROM search_history WHERE user_id = ?", (int(user_id),)
-        )
-
-    async def delete_search_query(self, user_id: int, query: str) -> int:
-        """Delete every occurrence of one query; return the removed count."""
-        cleaned = " ".join(str(query or "").split())
-        if not cleaned:
-            return 0
-        return await self._execute(
-            "DELETE FROM search_history WHERE user_id = ? AND query = ?",
-            (int(user_id), cleaned),
-        )
-
-    # ------------------------------------------------------------------ playlists
-
-    async def create_playlist(self, user_id: int, title: str) -> dict[str, Any]:
-        """Create a playlist and return its stored representation."""
-        cleaned = " ".join(str(title or "").split())
-        if not cleaned:
-            raise ValueError("playlist title is required")
-        cleaned = cleaned[:100]
-
-        connection = self._db()
         async with self._lock:
-            try:
-                cursor = await connection.execute(
-                    "INSERT INTO playlists (user_id, title) VALUES (?, ?)",
-                    (int(user_id), cleaned),
-                )
-                playlist_id = int(cursor.lastrowid or 0)
-                await cursor.close()
-                await connection.commit()
-            except Exception:
-                await connection.rollback()
-                raise
+            cursor = await self.connection.execute(
+                "DELETE FROM search_history WHERE user_id = ?;",
+                (int(user_id),),
+            )
+            deleted = max(0, cursor.rowcount)
+            await cursor.close()
+            await self.connection.commit()
+            return deleted
 
-            cursor = await connection.execute(
-                "SELECT id, user_id, title, created_at FROM playlists WHERE id = ?",
+    async def create_playlist(
+        self, user_id: int, title: str
+    ) -> dict[str, Any]:
+        cleaned = _normalize_playlist_title(title)
+        if not cleaned:
+            raise ValueError("Playlist title is required")
+
+        async with self._lock:
+            cursor = await self.connection.execute(
+                """
+                INSERT INTO playlists (user_id, title, created_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP);
+                """,
+                (int(user_id), cleaned),
+            )
+            playlist_id = cursor.lastrowid
+            await cursor.close()
+            await self.connection.commit()
+
+            cursor = await self.connection.execute(
+                """
+                SELECT id, user_id, title, created_at
+                FROM playlists
+                WHERE id = ?;
+                """,
                 (playlist_id,),
             )
-            try:
-                row = await cursor.fetchone()
-            finally:
-                await cursor.close()
-
-        if row is None:  # pragma: no cover - the row was created in this transaction
-            raise RuntimeError("Failed to read the created playlist")
-        return dict(row)
+            row = await cursor.fetchone()
+            await cursor.close()
+            return dict(row) if row else {"id": playlist_id, "title": cleaned}
 
     async def list_playlists(self, user_id: int) -> list[dict[str, Any]]:
-        """Return playlists with the number of tracks in each."""
-        return await self._fetch_all(
-            """
-            SELECT p.id, p.user_id, p.title, p.created_at,
-                   COUNT(pt.id) AS track_count
-            FROM playlists AS p
-            LEFT JOIN playlist_tracks AS pt ON pt.playlist_id = p.id
-            WHERE p.user_id = ?
-            GROUP BY p.id
-            ORDER BY p.created_at DESC, p.id DESC
-            """,
-            (int(user_id),),
-        )
-
-    async def delete_playlist(self, user_id: int, playlist_id: int) -> bool:
-        """Delete a playlist owned by the user. Tracks are removed by cascade."""
-        changed = await self._execute(
-            "DELETE FROM playlists WHERE id = ? AND user_id = ?",
-            (int(playlist_id), int(user_id)),
-        )
-        return changed > 0
+        async with self._lock:
+            cursor = await self.connection.execute(
+                """
+                SELECT
+                    p.id,
+                    p.user_id,
+                    p.title,
+                    p.created_at,
+                    COUNT(pt.track_id) AS track_count
+                FROM playlists p
+                LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
+                WHERE p.user_id = ?
+                GROUP BY p.id
+                ORDER BY p.created_at DESC, p.id DESC;
+                """,
+                (int(user_id),),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
 
     async def playlist_owned(self, user_id: int, playlist_id: int) -> bool:
-        """Return True when the playlist exists and belongs to the user."""
-        return await self._playlist_owned(user_id, playlist_id)
-
-    async def _playlist_owned(self, user_id: int, playlist_id: int) -> bool:
-        row = await self._fetch_one(
-            "SELECT 1 AS ok FROM playlists WHERE id = ? AND user_id = ?",
-            (int(playlist_id), int(user_id)),
-        )
-        return row is not None
-
-    async def add_track_to_playlist(
-        self, user_id: int, playlist_id: int, track: Mapping[str, Any]
-    ) -> bool | None:
-        """Add a track to a playlist.
-
-        Returns None when the playlist does not belong to the user, False for a
-        duplicate track and True when the track was added.
-        """
-        values = _track_values(track)
-        connection = self._db()
-
         async with self._lock:
-            try:
-                cursor = await connection.execute(
-                    "SELECT 1 AS ok FROM playlists WHERE id = ? AND user_id = ?",
-                    (int(playlist_id), int(user_id)),
-                )
-                try:
-                    owned = await cursor.fetchone()
-                finally:
-                    await cursor.close()
-                if owned is None:
-                    return None
+            cursor = await self.connection.execute(
+                "SELECT 1 FROM playlists WHERE id = ? AND user_id = ?;",
+                (int(playlist_id), int(user_id)),
+            )
+            owned = await cursor.fetchone() is not None
+            await cursor.close()
+            return owned
 
-                cursor = await connection.execute(
-                    """
-                    SELECT COALESCE(MAX(position), -1) + 1
-                    FROM playlist_tracks
-                    WHERE playlist_id = ?
-                    """,
-                    (int(playlist_id),),
-                )
-                try:
-                    row = await cursor.fetchone()
-                finally:
-                    await cursor.close()
-                position = int(row[0]) if row is not None else 0
-
-                cursor = await connection.execute(
-                    """
-                    INSERT OR IGNORE INTO playlist_tracks
-                        (playlist_id, track_id, title, artist, url, thumbnail,
-                         duration, position)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (int(playlist_id), *values, position),
-                )
-                try:
-                    changed = cursor.rowcount > 0
-                finally:
-                    await cursor.close()
-
-                await connection.commit()
-                return changed
-            except Exception:
-                await connection.rollback()
-                raise
+    async def delete_playlist(self, user_id: int, playlist_id: int) -> bool:
+        async with self._lock:
+            cursor = await self.connection.execute(
+                "DELETE FROM playlists WHERE id = ? AND user_id = ?;",
+                (int(playlist_id), int(user_id)),
+            )
+            deleted = cursor.rowcount > 0
+            await cursor.close()
+            await self.connection.commit()
+            return deleted
 
     async def list_playlist_tracks(
         self, user_id: int, playlist_id: int
     ) -> list[dict[str, Any]] | None:
-        """Return playlist tracks in order, or None if the playlist is not owned."""
-        if not await self._playlist_owned(user_id, playlist_id):
-            return None
-        return await self._fetch_all(
-            """
-            SELECT track_id, title, artist, url, thumbnail, duration,
-                   position, added_at
-            FROM playlist_tracks
-            WHERE playlist_id = ?
-            ORDER BY position, id
-            """,
-            (int(playlist_id),),
-        )
+        async with self._lock:
+            cursor = await self.connection.execute(
+                "SELECT 1 FROM playlists WHERE id = ? AND user_id = ?;",
+                (int(playlist_id), int(user_id)),
+            )
+            owned = await cursor.fetchone() is not None
+            await cursor.close()
+            if not owned:
+                return None
+
+            cursor = await self.connection.execute(
+                """
+                SELECT track_id, title, artist, duration, thumbnail, url, position, added_at
+                FROM playlist_tracks
+                WHERE playlist_id = ?
+                ORDER BY position ASC, added_at ASC;
+                """,
+                (int(playlist_id),),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return [dict(row) for row in rows]
+
+    async def add_track_to_playlist(
+        self, user_id: int, playlist_id: int, track: dict[str, Any]
+    ) -> bool | None:
+        track_id = str(track.get("track_id") or "").strip()
+        title = str(track.get("title") or "").strip()
+        if not track_id or not title:
+            raise ValueError("track_id and title are required")
+
+        artist = str(track.get("artist") or "").strip()
+        duration = _normalize_duration(track.get("duration"))
+        thumbnail = str(track.get("thumbnail") or "").strip()
+        url = str(track.get("url") or "").strip()
+
+        async with self._lock:
+            cursor = await self.connection.execute(
+                "SELECT 1 FROM playlists WHERE id = ? AND user_id = ?;",
+                (int(playlist_id), int(user_id)),
+            )
+            owned = await cursor.fetchone() is not None
+            await cursor.close()
+            if not owned:
+                return None
+
+            cursor = await self.connection.execute(
+                "SELECT 1 FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?;",
+                (int(playlist_id), track_id),
+            )
+            existed = await cursor.fetchone() is not None
+            await cursor.close()
+            if existed:
+                return False
+
+            cursor = await self.connection.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM playlist_tracks WHERE playlist_id = ?;",
+                (int(playlist_id),),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            next_pos = int(row[0]) if row else 0
+
+            await self.connection.execute(
+                """
+                INSERT INTO playlist_tracks (
+                    playlist_id, position, track_id, title, artist, duration, thumbnail, url, added_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+                """,
+                (
+                    int(playlist_id),
+                    next_pos,
+                    track_id,
+                    title,
+                    artist,
+                    duration,
+                    thumbnail,
+                    url,
+                ),
+            )
+            await self.connection.commit()
+            return True
 
     async def remove_track_from_playlist(
         self, user_id: int, playlist_id: int, track_id: str
     ) -> bool:
-        """Remove a track from a playlist owned by the user."""
-        changed = await self._execute(
-            """
-            DELETE FROM playlist_tracks
-            WHERE playlist_id = ?
-              AND track_id = ?
-              AND EXISTS (
-                  SELECT 1 FROM playlists
-                  WHERE id = ? AND user_id = ?
-              )
-            """,
-            (int(playlist_id), str(track_id), int(playlist_id), int(user_id)),
-        )
-        return changed > 0
+        cleaned_id = str(track_id or "").strip()
+        if not cleaned_id:
+            return False
 
-
-# ---------------------------------------------------------------------------
-# Module-level helpers required by the project plan (Phase 1, step 1.4).
-# ---------------------------------------------------------------------------
-
-_default_database: Database | None = None
-
-
-async def init_db(path: str | Path | None = None) -> Database:
-    """Initialize the shared database and return it.
-
-    When ``path`` is omitted, ``DB_PATH`` from the application settings is used.
-    Calling the function again for the same database is safe and keeps the
-    existing connection.
-    """
-    global _default_database
-
-    if _default_database is not None:
-        if path is None or str(path) == str(_default_database.path):
-            return _default_database
-        await _default_database.close()
-        _default_database = None
-
-    if path is None:
-        from config import load_settings
-
-        path = load_settings().db_path
-
-    database = Database(path)
-    await database.connect()
-    _default_database = database
-    return database
-
-
-async def close_db() -> None:
-    """Close the shared database opened by :func:`init_db`."""
-    global _default_database
-    if _default_database is not None:
-        await _default_database.close()
-        _default_database = None
-
-
-def get_db() -> Database:
-    """Return the shared database, raising a clear error before initialization."""
-    if _default_database is None:
-        raise RuntimeError("Database is not initialized; call init_db() first")
-    return _default_database
-
-
-async def add_favorite(
-    user_id: int,
-    track: Mapping[str, Any] | str,
-    title: str | None = None,
-    artist: str = "",
-    duration: int = 0,
-    thumbnail: str = "",
-) -> bool:
-    """Add a track to the shared database's favorites.
-
-    Accepts either a track mapping with ``track_id``/``title`` or positional
-    ``track_id``, ``title``, ``artist``, ``duration`` and ``thumbnail`` values.
-    """
-    if isinstance(track, Mapping):
-        payload: Mapping[str, Any] = track
-    else:
-        payload = {
-            "track_id": str(track),
-            "title": title or "",
-            "artist": artist,
-            "duration": duration,
-            "thumbnail": thumbnail,
-        }
-    return await get_db().add_favorite(user_id, payload)
-
-
-async def remove_favorite(user_id: int, track_id: str) -> bool:
-    """Remove a track from the shared database's favorites."""
-    return await get_db().remove_favorite(user_id, track_id)
-
-
-async def get_favorites(user_id: int) -> list[dict[str, Any]]:
-    """Return favorites of a user from the shared database."""
-    return await get_db().list_favorites(user_id)
+        async with self._lock:
+            cursor = await self.connection.execute(
+                """
+                DELETE FROM playlist_tracks
+                WHERE playlist_id = ?
+                  AND track_id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM playlists WHERE id = ? AND user_id = ?
+                  );
+                """,
+                (int(playlist_id), cleaned_id, int(playlist_id), int(user_id)),
+            )
+            deleted = cursor.rowcount > 0
+            await cursor.close()
+            await self.connection.commit()
+            return deleted
