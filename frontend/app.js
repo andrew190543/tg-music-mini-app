@@ -3223,7 +3223,7 @@
   const BG_PREFETCH_TIMEOUT_MS = 90000;
   // Если на HyperOS playback всё равно обрывается — поставь true:
   // тихой петлёй не даём системе заморозить процесс во время смены трека.
-  const BG_SILENT_KEEPALIVE = false;
+  const BG_SILENT_KEEPALIVE = true;
 
   const bgPrefetch = {
     trackId: "",
