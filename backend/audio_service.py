@@ -1522,10 +1522,12 @@ async def get_wave_by_mood(vibe: str, limit: int = 15) -> list[dict[str, Any]]:
 def _discover_similar_queries_sync(
     artists: list[str], favorite_titles: set[str], limit: int
 ) -> list[str]:
+    """Ищет похожих исполнителей и треки через Deezer для подбора по жанру."""
     queries: list[str] = []
     try:
-        with httpx.Client(timeout=6.0, follow_redirects=True) as client:
-            for artist in artists[:4]:
+        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
+            # Увеличили охват до 6 артистов для лучших рекомендаций
+            for artist in artists[:6]:
                 try:
                     found = (
                         client.get(
@@ -1538,15 +1540,16 @@ def _discover_similar_queries_sync(
                     if not found:
                         continue
                     aid = found[0]["id"]
+                    # Похожие исполнители близки по жанру и стилю
                     related = (
                         client.get(
                             f"https://api.deezer.com/artist/{aid}/related",
-                            params={"limit": 4},
+                            params={"limit": 6},
                         )
                         .json()
                         .get("data", [])
                     )
-                    for rel in related[:3]:
+                    for rel in related[:5]:
                         rel_name = str(rel.get("name") or "").strip()
                         if not rel_name:
                             continue
@@ -1591,23 +1594,11 @@ async def get_wave_personalized(
         for f in (favorites or [])
         if isinstance(f, Mapping)
     ]
+
+    # Уникальные исполнители из любимых треков (до 6 — для разнообразия жанров)
     artist_names = list(
         dict.fromkeys(p["artist"] for p in parsed if p["artist"])
-    )[:5]
-    vibe_counts: dict[str, int] = {}
-    for parsed_item in parsed:
-        vibe_counts[parsed_item["vibe"]] = (
-            vibe_counts.get(parsed_item["vibe"], 0) + 1
-        )
-    if vibe_counts:
-        best_count = max(vibe_counts.values())
-        detected_vibe = next(
-            vibe
-            for vibe in ("aggressive", "sad", "calm", "energetic")
-            if vibe_counts.get(vibe, 0) == best_count
-        )
-    else:
-        detected_vibe = "energetic"
+    )[:6]
 
     favorite_titles = {
         _normalize_song_title(x) for p in parsed for x in (p["title"],)
@@ -1617,7 +1608,9 @@ async def get_wave_personalized(
         for f in (favorites or [])
         if isinstance(f, Mapping)
     )
-    profile = build_taste_profile(favorites, max_artists=8, sample_size=5)
+
+    # Профиль вкуса строим по реальным исполнителям пользователя
+    profile = build_taste_profile(favorites, max_artists=6, sample_size=6)
 
     favorite_ids = {
         str(favorite.get("track_id") or "").strip()
@@ -1642,14 +1635,20 @@ async def get_wave_personalized(
         tracks.extend(more)
         seen.update(track["track_id"] for track in more)
 
+    # Этап 1: Гибкие запросы по исполнителям пользователя, без привязки к жанру
     artist_queries = [
         query
-        for artist in artist_names[:3]
-        for query in (f"{artist} popular track", f"{artist} feat")
+        for artist in artist_names[:5]
+        for query in (
+            f"{artist} popular tracks",
+            f"{artist} new music",
+            f"{artist} feat",
+            f"{artist} remix",
+        )
     ]
-    style_queries = list(VIBE_STYLE_QUERIES.get(detected_vibe, ()))
-    await gather_batch(profile + artist_queries + style_queries)
+    await gather_batch(profile + artist_queries)
 
+    # Этап 2: Поиск по похожим исполнителям и жанрам через Deezer API
     if len(tracks) < safe_limit and artist_names:
         try:
             discovered_queries = await asyncio.wait_for(
@@ -1657,29 +1656,33 @@ async def get_wave_personalized(
                     _discover_similar_queries_sync,
                     artist_names,
                     favorite_titles,
-                    6,
+                    15,  # Увеличили лимит запросов для лучшего покрытия
                 ),
-                timeout=8.0,
+                timeout=12.0,
             )
             if discovered_queries:
                 await gather_batch(discovered_queries)
         except (asyncio.TimeoutError, Exception):
             pass
 
-    if parsed:
-        topup_pool = list(WAVE_MOOD_QUERIES.get(detected_vibe, ()))
-    else:
-        topup_pool = [
-            query
-            for vibe_queries in WAVE_MOOD_QUERIES.values()
-            for query in vibe_queries
-        ]
-    topup_pool += list(TRENDING_FALLBACK_QUERIES)
+    # Этап 3: Динамический добор по тем же исполнителям (лайв, акустика, миксы)
+    # Жесткие списки TRENDING_FALLBACK_QUERIES и WAVE_MOOD_QUERIES не используются
+    dynamic_topup = []
+    for artist in artist_names[:5]:
+        dynamic_topup.extend(
+            [
+                f"{artist} acoustic",
+                f"{artist} live session",
+                f"best of {artist}",
+                f"{artist} mix",
+                f"{artist} unreleased",
+            ]
+        )
 
     rounds = 0
     while len(tracks) < safe_limit and rounds < WAVE_TOPUP_MAX_ROUNDS:
         rounds += 1
-        fresh_pool = [query for query in topup_pool if query not in used_queries]
+        fresh_pool = [query for query in dynamic_topup if query not in used_queries]
         if not fresh_pool:
             break
         batch = random.sample(
