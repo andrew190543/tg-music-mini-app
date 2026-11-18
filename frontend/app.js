@@ -215,7 +215,7 @@
   };
 
   const audio = PlayerState.audio;
-  audio.preload = "metadata";
+  audio.preload = "auto";
 
   const repeatStates = ["none", "all", "one"];
   const repeatLabels = {
@@ -2648,7 +2648,7 @@
     probe.onload = () => {
       element.style.backgroundImage = `url("${String(proxied).replace(
         /"/g,
-        '\\"'
+        "%22"
       )}")`;
       element.classList.add("has-image");
     };
@@ -2906,6 +2906,42 @@
 
     savePlayerState({ force: true, position: pendingSeekSeconds });
 
+    if (retryAttempt > 0) {
+      // Повтор после ошибки: сбрасываем потенциально «битый» blob.
+      if (bgPrefetch.trackId === track.track_id) {
+        bgResetPrefetch();
+      }
+      bgReleaseCurrentBlob();
+    } else {
+      // Мгновенный старт из предзагруженного blob: без сети и таймеров,
+      // работает на заблокированном экране.
+      const blobUrl = bgTakePrefetch(track.track_id);
+      if (blobUrl) {
+        bgStartBlobPlayback(track, blobUrl);
+        bgEnsurePrefetch();
+        return;
+      }
+    }
+
+    // Этот трек уже качается предзагрузкой — дождёмся её, а не второго запроса.
+    const inflight = bgInflightPrefetch(track.track_id);
+    if (inflight) {
+      try {
+        await inflight;
+      } catch {
+        // Упало — пойдём обычным путём ниже.
+      }
+      if (PlayerState.currentIndex !== index) {
+        return;
+      }
+      const blobUrl = bgTakePrefetch(track.track_id);
+      if (blobUrl) {
+        bgStartBlobPlayback(track, blobUrl);
+        bgEnsurePrefetch();
+        return;
+      }
+    }
+
     const streamUrl = buildStreamUrl(track.track_id, retryAttempt);
     const controller = new AbortController();
     activeStreamAbort = controller;
@@ -2920,7 +2956,12 @@
       if (!probe.ok && probe.status !== 206) {
         throw new Error(`Stream HTTP ${probe.status}`);
       }
-      await probe.arrayBuffer();
+      if (probe.status === 206) {
+        await probe.arrayBuffer();
+      } else {
+        // Сервер проигнорировал Range — не качаем весь файл дважды.
+        try { await probe.body?.cancel(); } catch { /* ignore */ }
+      }
     } catch (err) {
       if (err?.name === "AbortError" || PlayerState.currentIndex !== index) {
         return;
@@ -2937,6 +2978,7 @@
       return;
     }
 
+    bgReleaseCurrentBlob();
     audio.src = streamUrl;
     audio.load();
     audio.volume = PlayerState.volume;
@@ -2947,6 +2989,7 @@
     if (playPromise?.catch) {
       playPromise.catch(handlePlaybackFailure);
     }
+    bgEnsurePrefetch();
   }
 
   function replayCurrent() {
@@ -3020,27 +3063,24 @@
       return;
     }
 
-    let next;
-    if (PlayerState.isShuffle) {
-      next = pickRandomIndex();
-    } else {
-      next = PlayerState.currentIndex + 1;
-    }
+    // Индекс, выбранный заранее: совпадает с предзагруженным треком
+    // (критично для shuffle и для игры на заблокированном экране).
+    let next = bgPlannedNextIndex();
 
     if (next >= length) {
       if (queueSource !== "wave") {
         next = 0;
-        playTrack(next);
-        return;
+      } else {
+        await appendMoreWaveTracks();
+        const grownLength = PlayerState.queue.length;
+        next = grownLength > length ? Math.min(next, grownLength - 1) : 0;
       }
+    }
 
-      await appendMoreWaveTracks();
-      const grownLength = PlayerState.queue.length;
-      if (grownLength > length) {
-        playTrack(Math.min(next, grownLength - 1));
-        return;
-      }
-      next = 0;
+    if (next === PlayerState.currentIndex) {
+      // Очередь из одного трека: повторяем без сетевого запроса.
+      replayCurrent();
+      return;
     }
 
     playTrack(next);
@@ -3169,6 +3209,396 @@
       playTrack(index);
     }
   }
+
+  /* ---------- Background playback: предзагрузка следующего трека ---------- */
+
+  /*
+   * Пока текущий трек играет, процесс Telegram жив, и мы заранее скачиваем
+   * следующий трек в Blob. На "ended" источник переключается синхронно,
+   * без сети и таймеров — заморозка WebView на локскрине не успевает помешать.
+   */
+
+  const BG_PREFETCH_MAX_BYTES = 64 * 1024 * 1024;
+  const BG_PREFETCH_RETRY_MS = 5000;
+  const BG_PREFETCH_TIMEOUT_MS = 90000;
+  // Если на HyperOS playback всё равно обрывается — поставь true:
+  // тихой петлёй не даём системе заморозить процесс во время смены трека.
+  const BG_SILENT_KEEPALIVE = false;
+
+  const bgPrefetch = {
+    trackId: "",
+    index: -1,
+    fromIndex: -1,
+    fromId: "",
+    shuffle: false,
+    repeat: "none",
+    blobUrl: null,
+    promise: null,
+    abort: null,
+    failedAt: 0,
+  };
+
+  let bgCurrentBlobUrl = null;
+  let bgPausedByUser = false;
+  let bgPlayingWhenHidden = false;
+  let bgKeepAliveAudio = null;
+  let bgMediaHooked = false;
+
+  function bgResetPrefetch() {
+    if (bgPrefetch.abort) {
+      try { bgPrefetch.abort.abort(); } catch { /* ignore */ }
+    }
+    if (bgPrefetch.blobUrl) {
+      try { URL.revokeObjectURL(bgPrefetch.blobUrl); } catch { /* ignore */ }
+    }
+    bgPrefetch.trackId = "";
+    bgPrefetch.index = -1;
+    bgPrefetch.fromIndex = -1;
+    bgPrefetch.fromId = "";
+    bgPrefetch.shuffle = false;
+    bgPrefetch.repeat = "none";
+    bgPrefetch.blobUrl = null;
+    bgPrefetch.promise = null;
+    bgPrefetch.abort = null;
+    bgPrefetch.failedAt = 0;
+  }
+
+  function bgPrefetchValid() {
+    if (!bgPrefetch.trackId) {
+      return false;
+    }
+    const current = PlayerState.queue[PlayerState.currentIndex];
+    return (
+      bgPrefetch.fromIndex === PlayerState.currentIndex &&
+      bgPrefetch.fromId === (current?.track_id || "") &&
+      bgPrefetch.shuffle === PlayerState.isShuffle &&
+      bgPrefetch.repeat === PlayerState.repeatMode &&
+      PlayerState.queue[bgPrefetch.index]?.track_id === bgPrefetch.trackId
+    );
+  }
+
+  function bgPlanNextIndex() {
+    const length = PlayerState.queue.length;
+    if (!length) {
+      return -1;
+    }
+    if (PlayerState.currentIndex === -1) {
+      return 0;
+    }
+    if (PlayerState.isShuffle) {
+      return pickRandomIndex();
+    }
+    const next = PlayerState.currentIndex + 1;
+    if (next < length) {
+      return next;
+    }
+    return queueSource === "wave" ? length : 0;
+  }
+
+  // Для nextTrack(): заранее выбранный индекс совпадает с предзагруженным треком.
+  function bgPlannedNextIndex() {
+    if (bgPrefetchValid()) {
+      return bgPrefetch.index;
+    }
+    return bgPlanNextIndex();
+  }
+
+  function bgStartPrefetch(index) {
+    const track = PlayerState.queue[index];
+    const current = PlayerState.queue[PlayerState.currentIndex];
+    if (!track?.track_id || !current?.track_id) {
+      return;
+    }
+    if (bgPrefetch.trackId) {
+      bgResetPrefetch();
+    }
+
+    const controller = new AbortController();
+    bgPrefetch.trackId = track.track_id;
+    bgPrefetch.index = index;
+    bgPrefetch.fromIndex = PlayerState.currentIndex;
+    bgPrefetch.fromId = current.track_id;
+    bgPrefetch.shuffle = PlayerState.isShuffle;
+    bgPrefetch.repeat = PlayerState.repeatMode;
+    bgPrefetch.abort = controller;
+    bgPrefetch.failedAt = 0;
+    bgPrefetch.blobUrl = null;
+
+    const promise = (async () => {
+      const response = await fetch(buildStreamUrl(track.track_id), {
+        signal: controller.signal,
+        headers: { Accept: "*/*" },
+      });
+      if (!response.ok) {
+        throw new Error(`Prefetch HTTP ${response.status}`);
+      }
+      let blob = await response.blob();
+      if (controller.signal.aborted || bgPrefetch.abort !== controller) {
+        return;
+      }
+      if (!blob.size || blob.size > BG_PREFETCH_MAX_BYTES) {
+        throw new Error("Prefetch: недопустимый размер файла");
+      }
+      if (!blob.type || !blob.type.startsWith("audio/")) {
+        blob = new Blob([blob], { type: "audio/mp4" });
+      }
+      bgPrefetch.blobUrl = URL.createObjectURL(blob);
+    })();
+
+    bgPrefetch.promise = promise;
+    const timeoutId = window.setTimeout(() => {
+      if (bgPrefetch.abort === controller && !bgPrefetch.blobUrl) {
+        try { controller.abort(); } catch { /* ignore */ }
+      }
+    }, BG_PREFETCH_TIMEOUT_MS);
+
+    promise.then(
+      () => {
+        window.clearTimeout(timeoutId);
+        if (bgPrefetch.abort === controller) {
+          bgPrefetch.promise = null;
+        }
+      },
+      (error) => {
+        window.clearTimeout(timeoutId);
+        if (bgPrefetch.abort !== controller) {
+          return;
+        }
+        bgPrefetch.promise = null;
+        bgPrefetch.failedAt = Date.now();
+        if (error?.name !== "AbortError") {
+          console.warn("Next-track prefetch failed:", error);
+        }
+      }
+    );
+  }
+
+  function bgEnsurePrefetch() {
+    const current = PlayerState.queue[PlayerState.currentIndex];
+    if (!current?.track_id) {
+      if (bgPrefetch.trackId) {
+        bgResetPrefetch();
+      }
+      return;
+    }
+    if (bgPrefetch.trackId && !bgPrefetchValid()) {
+      bgResetPrefetch();
+    }
+    if (PlayerState.repeatMode === "one") {
+      return;
+    }
+    if (bgPrefetch.trackId) {
+      if (bgPrefetch.blobUrl || bgPrefetch.promise) {
+        return;
+      }
+      if (Date.now() - bgPrefetch.failedAt < BG_PREFETCH_RETRY_MS) {
+        return;
+      }
+      bgResetPrefetch();
+    }
+
+    const index = bgPlanNextIndex();
+    if (index < 0 || index >= PlayerState.queue.length) {
+      // «Волна»: очередь дорастит playTrack сам — перепроверим на следующем timeupdate.
+      return;
+    }
+    if (index === PlayerState.currentIndex) {
+      return;
+    }
+    bgStartPrefetch(index);
+  }
+
+  function bgTakePrefetch(trackId) {
+    if (bgPrefetch.trackId !== trackId || !bgPrefetch.blobUrl) {
+      return null;
+    }
+    const url = bgPrefetch.blobUrl;
+    bgPrefetch.blobUrl = null;
+    bgResetPrefetch();
+    return url;
+  }
+
+  function bgInflightPrefetch(trackId) {
+    return bgPrefetch.trackId === trackId && bgPrefetch.promise
+      ? bgPrefetch.promise
+      : null;
+  }
+
+  function bgReleaseCurrentBlob() {
+    if (!bgCurrentBlobUrl) {
+      return;
+    }
+    try { URL.revokeObjectURL(bgCurrentBlobUrl); } catch { /* ignore */ }
+    bgCurrentBlobUrl = null;
+  }
+
+  function bgStartBlobPlayback(track, blobUrl) {
+    const previous = bgCurrentBlobUrl;
+    bgCurrentBlobUrl = blobUrl;
+    audio.src = blobUrl;
+    audio.load();
+    audio.volume = PlayerState.volume;
+    updateMediaSession(track);
+    updatePositionState(0, 0, true);
+    if (previous && previous !== blobUrl) {
+      try { URL.revokeObjectURL(previous); } catch { /* ignore */ }
+    }
+    audio.play()?.catch?.(handlePlaybackFailure);
+  }
+
+  /* --- опциональный тихий keep-alive (BG_SILENT_KEEPALIVE) --- */
+
+  function bgSilentWavUrl() {
+    const sampleRate = 8000;
+    const samples = sampleRate; // 1 секунда тишины
+    const buffer = new ArrayBuffer(44 + samples * 2);
+    const view = new DataView(buffer);
+    const write = (offset, text) => {
+      for (let i = 0; i < text.length; i += 1) {
+        view.setUint8(offset + i, text.charCodeAt(i));
+      }
+    };
+    write(0, "RIFF");
+    view.setUint32(4, 36 + samples * 2, true);
+    write(8, "WAVE");
+    write(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    write(36, "data");
+    view.setUint32(40, samples * 2, true);
+    return URL.createObjectURL(new Blob([buffer], { type: "audio/wav" }));
+  }
+
+  function bgStartKeepAlive() {
+    if (!BG_SILENT_KEEPALIVE) {
+      return;
+    }
+    try {
+      if (!bgKeepAliveAudio) {
+        bgKeepAliveAudio = new Audio(bgSilentWavUrl());
+        bgKeepAliveAudio.loop = true;
+        bgKeepAliveAudio.volume = 0.001;
+        bgKeepAliveAudio.preload = "auto";
+      }
+      if (bgKeepAliveAudio.paused) {
+        bgKeepAliveAudio.play()?.catch?.(() => {});
+      }
+    } catch { /* keep-alive — best-effort */ }
+  }
+
+  function bgStopKeepAlive() {
+    try { bgKeepAliveAudio?.pause(); } catch { /* ignore */ }
+  }
+
+  /* --- учёт «пользователь сам поставил паузу» (кнопки + шторка/гарнитура) --- */
+
+  function bgHookMediaSession() {
+    if (bgMediaHooked || !("mediaSession" in navigator)) {
+      return;
+    }
+    bgMediaHooked = true;
+    const ms = navigator.mediaSession;
+    const set = (action, handler) => {
+      try { ms.setActionHandler(action, handler); } catch { /* unsupported */ }
+    };
+    set("play", () => {
+      bgPausedByUser = false;
+      markUserPlaybackAction();
+      if (PlayerState.currentIndex === -1 || !audio.src) {
+        togglePlay();
+      } else {
+        audio.play()?.catch?.(handlePlaybackFailure);
+      }
+    });
+    set("pause", () => {
+      bgPausedByUser = true;
+      markUserPlaybackAction();
+      audio.pause();
+    });
+    set("stop", () => {
+      bgPausedByUser = true;
+      markUserPlaybackAction();
+      audio.pause();
+      try { audio.currentTime = 0; } catch { /* ignore */ }
+      PlayerState.isPlaying = false;
+      renderPlayState();
+      updateTimeline();
+      setMediaPlaybackState("none");
+    });
+  }
+
+  audio.addEventListener("play", () => {
+    bgPausedByUser = false;
+    bgHookMediaSession();
+    bgStartKeepAlive();
+  });
+
+  audio.addEventListener("playing", () => {
+    bgEnsurePrefetch();
+  });
+
+  audio.addEventListener("timeupdate", () => {
+    bgEnsurePrefetch();
+  });
+
+  audio.addEventListener("pause", () => {
+    if (bgPausedByUser) {
+      bgStopKeepAlive();
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) {
+      return;
+    }
+    if (target.closest("#mini-play, #play-btn")) {
+      bgPausedByUser = !audio.paused;
+      return;
+    }
+    const card = target.closest(".track-card");
+    if (card) {
+      const currentId =
+        PlayerState.queue[PlayerState.currentIndex]?.track_id;
+      bgPausedByUser =
+        card.dataset.trackId === currentId ? !audio.paused : false;
+      return;
+    }
+    if (
+      target.closest("#mini-next, #next-btn, #prev-btn, #playlist-play, .wave-start")
+    ) {
+      bgPausedByUser = false;
+    }
+  }, true);
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      bgPlayingWhenHidden = PlayerState.isPlaying && !audio.paused;
+      return;
+    }
+    // Экран разблокировали: если трек доиграл в «заморозке» и следующий
+    // не стартовал — догоняем очередь автоматически.
+    bgEnsurePrefetch();
+    if (bgPausedByUser || PlayerState.currentIndex < 0) {
+      return;
+    }
+    if (audio.ended && PlayerState.queue.length) {
+      void nextTrack({ fromEnded: true });
+      return;
+    }
+    if (bgPlayingWhenHidden && audio.paused && audio.src && !audio.error) {
+      audio.play()?.catch?.(() => {});
+    }
+  });
+
+  window.addEventListener("pagehide", () => {
+    bgStopKeepAlive();
+  });
 
   /* ---------- Timeline & volume ---------- */
 
